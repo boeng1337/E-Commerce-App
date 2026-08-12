@@ -31,20 +31,25 @@ jobs:
       - name: Install frontend deps
         run: npm ci
 
-      - name: Build Tauri app (Arch)
+      - name: Build Tauri app (Arch, binary only)
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          APPIMAGE_EXTRACT_AND_RUN: "1"
-          NO_STRIP: "1"
         run: |
-          npm run tauri build -- --bundles appimage --verbose
+          npm run tauri build -- --no-bundle
+
+      - name: Package raw binary
+        run: |
+          mkdir -p dist-arch
+          cp src-tauri/target/release/aliexpress-manager dist-arch/
+          cp -r src-tauri/icons dist-arch/ || true
+          tar -czvf aliexpress-manager-arch-linux-x86_64.tar.gz -C dist-arch .
 
       - name: Upload Arch build artifacts
         uses: actions/upload-artifact@v4
         with:
           name: arch-linux-bundle
           path: |
-            src-tauri/target/release/bundle/appimage/*.AppImage
+            aliexpress-manager-arch-linux-x86_64.tar.gz
 
   build:
     runs-on: ubuntu-22.04
