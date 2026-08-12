@@ -34,11 +34,15 @@ jobs:
       - name: Install frontend deps
         run: npm ci
 
+      - name: Build frontend
+        run: npm run build
+
       - name: Build Tauri app (Arch, binary only)
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        working-directory: src-tauri
         run: |
-          npm run tauri build -- --bundles none
+          cargo build --release
 
       - name: Package raw binary
         run: |
