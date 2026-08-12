@@ -42,7 +42,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         working-directory: src-tauri
         run: |
-          cargo build --release
+          cargo build --release --features custom-protocol
 
       - name: Package raw binary
         run: |
@@ -82,16 +82,24 @@ jobs:
         run: npm ci
 
       - name: Build Tauri app
-        uses: tauri-apps/tauri-action@v0
+        uses: nick-fields/retry@v3
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # Add AliExpress API credentials as GitHub Actions secrets, then
-          # surface them at build/runtime as needed, e.g.:
-          # ALIEXPRESS_APP_KEY: ${{ secrets.ALIEXPRESS_APP_KEY }}
-          # ALIEXPRESS_APP_SECRET: ${{ secrets.ALIEXPRESS_APP_SECRET }}
         with:
-          tagName: ${{ github.ref_name }}
-          releaseName: "Listing Manager ${{ github.ref_name }}"
-          releaseBody: "Automated release. See CHANGELOG for details."
-          releaseDraft: true
+          timeout_minutes: 30
+          max_attempts: 3
+          retry_wait_seconds: 15
+          command: npx tauri build --ci
+
+      - name: Create/update draft release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: "Listing Manager ${{ github.ref_name }}"
+          body: "Automated release. See CHANGELOG for details."
+          draft: true
           prerelease: false
+          files: |
+            src-tauri/target/release/bundle/deb/*.deb
+            src-tauri/target/release/bundle/rpm/*.rpm
+            src-tauri/target/release/bundle/appimage/*.AppImage
