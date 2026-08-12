@@ -1,0 +1,84 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch: {}
+
+jobs:
+  build-arch:
+    runs-on: ubuntu-22.04
+    container:
+      image: archlinux:latest
+    steps:
+      - name: Install base deps
+        run: |
+          pacman -Syu --noconfirm
+          pacman -S --noconfirm --needed git base-devel curl wget file openssl \
+            webkit2gtk-4.1 librsvg libappindicator-gtk3 nodejs npm rustup fuse2
+
+      - name: Trust the workspace directory
+        run: git config --global --add safe.directory '*'
+
+      - uses: actions/checkout@v4
+
+      - name: Set up Rust
+        run: |
+          rustup default stable
+
+      - name: Install frontend deps
+        run: npm ci
+
+      - name: Build Tauri app (Arch)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          APPIMAGE_EXTRACT_AND_RUN: "1"
+          NO_STRIP: "1"
+        run: |
+          npm run tauri build -- --bundles appimage
+
+      - name: Upload Arch build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: arch-linux-bundle
+          path: |
+            src-tauri/target/release/bundle/appimage/*.AppImage
+
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev \
+            librsvg2-dev patchelf build-essential curl wget file libssl-dev
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install frontend deps
+        run: npm ci
+
+      - name: Build Tauri app
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Add AliExpress API credentials as GitHub Actions secrets, then
+          # surface them at build/runtime as needed, e.g.:
+          # ALIEXPRESS_APP_KEY: ${{ secrets.ALIEXPRESS_APP_KEY }}
+          # ALIEXPRESS_APP_SECRET: ${{ secrets.ALIEXPRESS_APP_SECRET }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: "Listing Manager ${{ github.ref_name }}"
+          releaseBody: "Automated release. See CHANGELOG for details."
+          releaseDraft: true
+          prerelease: false
