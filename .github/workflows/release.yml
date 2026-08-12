@@ -38,7 +38,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          npm run tauri build -- --no-bundle
+          npm run tauri build -- --bundles none
 
       - name: Package raw binary
         run: |
