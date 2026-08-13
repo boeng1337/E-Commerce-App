@@ -50,22 +50,19 @@ jobs:
           cp src-tauri/target/release/aliexpress-manager dist-arch/
           cp -r src-tauri/icons dist-arch/ || true
 
-          # Build the payload archive
           tar -czf payload.tar.gz -C dist-arch .
 
-          # Write the self-extracting stub: extracts itself to a temp dir,
-          # sets the env var needed to avoid the WebKitGTK EGL/DMA-BUF issue
-          # on Intel + Wayland/Hyprland setups, then runs the binary.
-          cat > aliexpress-manager-arch.run << 'STUB_EOF'
-#!/usr/bin/env bash
-set -e
-TMPDIR="$(mktemp -d /tmp/aliexpress-manager.XXXXXX)"
-ARCHIVE_LINE=$(awk '/^__PAYLOAD_BELOW__/ {print NR + 1; exit 0}' "$0")
-tail -n +"$ARCHIVE_LINE" "$0" | tar -xz -C "$TMPDIR"
-export WEBKIT_DISABLE_DMABUF_RENDERER=1
-exec "$TMPDIR/aliexpress-manager" "$@"
-__PAYLOAD_BELOW__
-STUB_EOF
+          printf '%s\n' \
+            '#!/usr/bin/env bash' \
+            'set -e' \
+            'TMPDIR="$(mktemp -d /tmp/aliexpress-manager.XXXXXX)"' \
+            'ARCHIVE_LINE=$(grep -an "^__PAYLOAD_BELOW__$" "$0" | head -1 | cut -d: -f1)' \
+            'ARCHIVE_LINE=$((ARCHIVE_LINE + 1))' \
+            'tail -n +"$ARCHIVE_LINE" "$0" | tar -xz -C "$TMPDIR"' \
+            'export WEBKIT_DISABLE_DMABUF_RENDERER=1' \
+            'exec "$TMPDIR/aliexpress-manager" "$@"' \
+            '__PAYLOAD_BELOW__' > aliexpress-manager-arch.run
+
           cat payload.tar.gz >> aliexpress-manager-arch.run
           chmod +x aliexpress-manager-arch.run
 
