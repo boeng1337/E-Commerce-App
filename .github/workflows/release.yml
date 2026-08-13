@@ -44,62 +44,38 @@ jobs:
         run: |
           cargo build --release --features custom-protocol
 
-      - name: Package raw binary
+      - name: Package as self-extracting single file
         run: |
           mkdir -p dist-arch
           cp src-tauri/target/release/aliexpress-manager dist-arch/
           cp -r src-tauri/icons dist-arch/ || true
-          tar -czvf aliexpress-manager-arch-linux-x86_64.tar.gz -C dist-arch .
 
-      - name: Upload Arch build artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: arch-linux-bundle
-          path: |
-            aliexpress-manager-arch-linux-x86_64.tar.gz
+          # Build the payload archive
+          tar -czf payload.tar.gz -C dist-arch .
 
-  build:
-    runs-on: ubuntu-22.04
-    steps:
-      - uses: actions/checkout@v4
+          # Write the self-extracting stub: extracts itself to a temp dir,
+          # sets the env var needed to avoid the WebKitGTK EGL/DMA-BUF issue
+          # on Intel + Wayland/Hyprland setups, then runs the binary.
+          cat > aliexpress-manager-arch.run << 'STUB_EOF'
+#!/usr/bin/env bash
+set -e
+TMPDIR="$(mktemp -d /tmp/aliexpress-manager.XXXXXX)"
+ARCHIVE_LINE=$(awk '/^__PAYLOAD_BELOW__/ {print NR + 1; exit 0}' "$0")
+tail -n +"$ARCHIVE_LINE" "$0" | tar -xz -C "$TMPDIR"
+export WEBKIT_DISABLE_DMABUF_RENDERER=1
+exec "$TMPDIR/aliexpress-manager" "$@"
+__PAYLOAD_BELOW__
+STUB_EOF
+          cat payload.tar.gz >> aliexpress-manager-arch.run
+          chmod +x aliexpress-manager-arch.run
 
-      - name: Install Linux system deps
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev \
-            librsvg2-dev patchelf build-essential curl wget file libssl-dev
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Set up Node
-        uses: actions/setup-node@v4
-        with:
-          node-version: 20
-          cache: npm
-
-      - name: Install frontend deps
-        run: npm ci
-
-      - name: Build Tauri app
-        uses: nick-fields/retry@v3
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          timeout_minutes: 30
-          max_attempts: 3
-          retry_wait_seconds: 15
-          command: npx tauri build --ci
-
-      - name: Create/update draft release
+      - name: Create/update release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}
           name: "Listing Manager ${{ github.ref_name }}"
-          body: "Automated release. See CHANGELOG for details."
-          draft: true
+          body: "Personal build. Download aliexpress-manager-arch.run, chmod +x it, and run it directly."
+          draft: false
           prerelease: false
           files: |
-            src-tauri/target/release/bundle/deb/*.deb
-            src-tauri/target/release/bundle/rpm/*.rpm
-            src-tauri/target/release/bundle/appimage/*.AppImage
+            aliexpress-manager-arch.run
