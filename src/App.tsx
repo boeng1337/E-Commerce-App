@@ -26,12 +26,65 @@ type Listing = {
   data_version: number | null;
   last_fetched: number | null;
   price_override: number | null;
+  store_country: string | null;
+  store_rating: number | null;
+  product_rating: number | null;
+  sales_count: string | null;
+  product_status: string | null;
+  ships: boolean | null;
 };
 
 type Settings = {
   concurrency: number;
   sleep_seconds: number;
+  home_country: string;
+  home_currency: string;
+  international_enabled: boolean;
+  check_countries: string[];
+  hidden_columns: string[];
+  sort_key: string | null;
+  sort_dir: string | null;
 };
+
+type CountryResult = {
+  country: string;
+  ships: boolean;
+  price_min: number | null;
+  price_max: number | null;
+  currency: string;
+  variants: Variant[];
+  error: string | null;
+};
+
+type InternationalResult = {
+  id: string;
+  countries: CountryResult[];
+};
+
+// EU market countries (mirrors the Rust default). region grouping for the
+// settings selector; extend with more regions later.
+const EU_COUNTRIES = [
+  "FR", "DE", "ES", "IT", "NL", "BE", "PL", "PT", "SE", "AT", "IE", "DK",
+  "FI", "GR", "CZ", "RO", "HU", "SK", "BG", "HR", "LT", "LV", "EE", "SI", "LU",
+];
+
+// Columns that can be shown/hidden. Persisted in settings via localStorage-free
+// approach: stored in component state, synced to a hidden settings field would
+// need backend; here we keep it in the settings.json-independent way below.
+const ALL_COLUMNS = [
+  { key: "category", label: "Category" },
+  { key: "warehouse", label: "Warehouse" },
+  { key: "price", label: "Price" },
+  { key: "stock", label: "Stock" },
+  { key: "store", label: "Store" },
+  { key: "store_rating", label: "Store ★" },
+  { key: "rating", label: "Rating" },
+  { key: "sales", label: "Sales" },
+  { key: "brand", label: "Brand" },
+  { key: "last_fetched", label: "Last fetched" },
+] as const;
+
+type ColumnKey = (typeof ALL_COLUMNS)[number]["key"];
 
 type BulkSearchResult = {
   added: number;
@@ -84,6 +137,13 @@ export default function App() {
   const [settings, setSettingsState] = useState<Settings>({
     concurrency: 1,
     sleep_seconds: 2,
+    home_country: "FR",
+    home_currency: "EUR",
+    international_enabled: false,
+    check_countries: EU_COUNTRIES,
+    hidden_columns: [],
+    sort_key: null,
+    sort_dir: null,
   });
 
   const [selected, setSelected] = useState<Set<string>>(new Set());
@@ -100,6 +160,13 @@ export default function App() {
 
   // image lightbox
   const [lightbox, setLightbox] = useState<{ images: string[]; index: number } | null>(null);
+
+  // international check
+  const [intl, setIntl] = useState<InternationalResult | null>(null);
+  const [intlBusy, setIntlBusy] = useState(false);
+
+  // column show/hide menu
+  const [columnsOpen, setColumnsOpen] = useState(false);
 
   // conflict popup for batch refetch over manually-edited listings
   const [conflict, setConflict] = useState<{ ids: string[]; edited: Listing[]; release: Set<string> } | null>(null);
@@ -138,6 +205,29 @@ export default function App() {
     refresh();
     loadSettings();
   }, []);
+
+  function closeDetail() {
+    setDetailId(null);
+    setDownloadMsg(null);
+    setCopiedDebug(false);
+    setEditingPrice(false);
+    setIntl(null);
+  }
+
+  // Escape closes the detail drawer
+  useEffect(() => {
+    if (!detailId) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") closeDetail();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [detailId]);
+
+  // Reset international results when switching to a different listing
+  useEffect(() => {
+    setIntl(null);
+  }, [detailId]);
 
   async function saveSettings(next: Settings) {
     try {
@@ -445,8 +535,111 @@ export default function App() {
   const outdatedCount = listings.filter(isOutdated).length;
   const allSelected = listings.length > 0 && selected.size === listings.length;
 
+  // --- Column visibility (persisted in settings) ---
+  const hidden = new Set(settings.hidden_columns);
+  function isColVisible(key: ColumnKey) {
+    return !hidden.has(key);
+  }
+  async function toggleColumn(key: ColumnKey) {
+    const next = new Set(settings.hidden_columns);
+    if (next.has(key)) next.delete(key);
+    else next.add(key);
+    await saveSettings({ ...settings, hidden_columns: Array.from(next) });
+  }
+
+  // --- Sorting (persisted in settings) ---
+  async function sortBy(key: string) {
+    let dir = "asc";
+    if (settings.sort_key === key) {
+      dir = settings.sort_dir === "asc" ? "desc" : "asc";
+    }
+    await saveSettings({ ...settings, sort_key: key, sort_dir: dir });
+  }
+
+  function sortValue(l: Listing, key: string): number | string {
+    switch (key) {
+      case "title": return l.title.toLowerCase();
+      case "category": return l.category ?? "";
+      case "warehouse": return l.warehouse ?? "";
+      case "price": return l.price_override ?? l.price_min ?? Infinity;
+      case "stock": return l.stock ?? -1;
+      case "store": return (l.store_name ?? "").toLowerCase();
+      case "store_rating": return l.store_rating ?? -1;
+      case "rating": return l.product_rating ?? -1;
+      case "sales": {
+        const n = parseInt((l.sales_count ?? "").replace(/\D/g, ""), 10);
+        return Number.isNaN(n) ? -1 : n;
+      }
+      case "brand": return (l.brand ?? "").toLowerCase();
+      case "last_fetched": return l.last_fetched ?? 0;
+      default: return 0;
+    }
+  }
+
+  const sortedListings = (() => {
+    if (!settings.sort_key) return listings;
+    const key = settings.sort_key;
+    const dir = settings.sort_dir === "desc" ? -1 : 1;
+    return [...listings].sort((a, b) => {
+      const av = sortValue(a, key);
+      const bv = sortValue(b, key);
+      if (av < bv) return -1 * dir;
+      if (av > bv) return 1 * dir;
+      return 0;
+    });
+  })();
+
+  function sortArrow(key: string) {
+    if (settings.sort_key !== key) return "";
+    return settings.sort_dir === "desc" ? " ▼" : " ▲";
+  }
+
+  // --- International check ---
+  async function runInternational() {
+    if (!detailListing) return;
+    if (!settings.international_enabled) {
+      setError("Enable the international check in Settings first.");
+      return;
+    }
+    setIntlBusy(true);
+    setIntl(null);
+    try {
+      const result = await invoke<InternationalResult>("check_international", {
+        id: detailListing.id,
+      });
+      setIntl(result);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setIntlBusy(false);
+    }
+  }
+
+  // region toggle in settings
+  async function toggleAllEU(on: boolean) {
+    await saveSettings({ ...settings, check_countries: on ? EU_COUNTRIES : [] });
+  }
+  async function toggleCountry(code: string) {
+    const next = new Set(settings.check_countries);
+    if (next.has(code)) next.delete(code);
+    else next.add(code);
+    await saveSettings({ ...settings, check_countries: Array.from(next) });
+  }
+
+  function stockLabel(l: Listing): string {
+    if (l.source === "manual") return l.stock != null ? String(l.stock) : "—";
+    if (l.ships === false) return "unavailable";
+    if (l.warehouse == null && (l.stock == null || l.stock === 0)) return "no shipping";
+    if (l.stock == null) return "—";
+    if (l.stock === 0) return "unavailable";
+    return String(l.stock);
+  }
+
   return (
-    <div className={`app ${detailListing ? "with-detail" : ""}`}>
+    <div
+      className={`app ${detailListing ? "with-detail" : ""}`}
+      onClick={() => { if (detailListing) closeDetail(); }}
+    >
       <header>
         <h1>Sourced Listings</h1>
         <button className="icon-btn" onClick={() => { setSettingsOpen(true); checkAuthStatus(); }} title="Settings">
@@ -475,6 +668,23 @@ export default function App() {
       {error && <div className="error">{error}</div>}
 
       <div className="toolbar">
+        <button className="ghost-btn" onClick={() => setColumnsOpen((v) => !v)}>
+          Columns ▾
+        </button>
+        {columnsOpen && (
+          <div className="columns-menu">
+            {ALL_COLUMNS.map((c) => (
+              <label key={c.key} className="columns-item">
+                <input
+                  type="checkbox"
+                  checked={isColVisible(c.key)}
+                  onChange={() => toggleColumn(c.key)}
+                />
+                {c.label}
+              </label>
+            ))}
+          </div>
+        )}
         {outdatedCount > 0 && (
           <button className="warn-btn" onClick={fetchAllOutdated} disabled={busy}>
             {outdatedCount} outdated — Refetch all
@@ -501,16 +711,22 @@ export default function App() {
               />
             </th>
             <th className="col-img"></th>
-            <th>Title</th>
-            <th>Category</th>
-            <th>Warehouse</th>
-            <th>Price</th>
-            <th>Last fetched</th>
+            <th className="sortable" onClick={() => sortBy("title")}>Title{sortArrow("title")}</th>
+            {isColVisible("category") && <th className="sortable" onClick={() => sortBy("category")}>Category{sortArrow("category")}</th>}
+            {isColVisible("warehouse") && <th className="sortable" onClick={() => sortBy("warehouse")}>Warehouse{sortArrow("warehouse")}</th>}
+            {isColVisible("price") && <th className="sortable" onClick={() => sortBy("price")}>Price{sortArrow("price")}</th>}
+            {isColVisible("stock") && <th className="sortable" onClick={() => sortBy("stock")}>Stock{sortArrow("stock")}</th>}
+            {isColVisible("store") && <th className="sortable" onClick={() => sortBy("store")}>Store{sortArrow("store")}</th>}
+            {isColVisible("store_rating") && <th className="sortable" onClick={() => sortBy("store_rating")}>Store ★{sortArrow("store_rating")}</th>}
+            {isColVisible("rating") && <th className="sortable" onClick={() => sortBy("rating")}>Rating{sortArrow("rating")}</th>}
+            {isColVisible("sales") && <th className="sortable" onClick={() => sortBy("sales")}>Sales{sortArrow("sales")}</th>}
+            {isColVisible("brand") && <th className="sortable" onClick={() => sortBy("brand")}>Brand{sortArrow("brand")}</th>}
+            {isColVisible("last_fetched") && <th className="sortable" onClick={() => sortBy("last_fetched")}>Last fetched{sortArrow("last_fetched")}</th>}
             <th className="col-actions"></th>
           </tr>
         </thead>
         <tbody>
-          {listings.map((l) => (
+          {sortedListings.map((l) => (
             <Fragment key={l.id}>
               <tr className={isOutdated(l) ? "row-outdated" : ""}>
                 <td className="col-check">
@@ -528,7 +744,7 @@ export default function App() {
                   )}
                 </td>
                 <td>
-                  <button className="title-link" onClick={() => setDetailId(l.id)}>
+                  <button className="title-link" onClick={(e) => { e.stopPropagation(); setDetailId(l.id); }}>
                     {l.title}
                   </button>
                   {isOutdated(l) && <span className="badge outdated">outdated</span>}
@@ -542,10 +758,20 @@ export default function App() {
                     </button>
                   )}
                 </td>
-                <td>{l.category ?? "—"}</td>
-                <td>{l.warehouse ?? "—"}</td>
-                <td>{displayPrice(l)}</td>
-                <td className="col-date">{formatDate(l.last_fetched)}</td>
+                {isColVisible("category") && <td>{l.category ?? "—"}</td>}
+                {isColVisible("warehouse") && <td>{l.warehouse ?? "—"}</td>}
+                {isColVisible("price") && <td>{displayPrice(l)}</td>}
+                {isColVisible("stock") && (
+                  <td className={stockLabel(l) === "unavailable" || stockLabel(l) === "no shipping" ? "stock-bad" : ""}>
+                    {stockLabel(l)}
+                  </td>
+                )}
+                {isColVisible("store") && <td>{l.store_name ?? "—"}</td>}
+                {isColVisible("store_rating") && <td>{l.store_rating != null ? l.store_rating.toFixed(1) : "—"}</td>}
+                {isColVisible("rating") && <td>{l.product_rating != null && l.product_rating > 0 ? l.product_rating.toFixed(1) : "—"}</td>}
+                {isColVisible("sales") && <td>{l.sales_count ?? "—"}</td>}
+                {isColVisible("brand") && <td>{l.brand ?? "—"}</td>}
+                {isColVisible("last_fetched") && <td className="col-date">{formatDate(l.last_fetched)}</td>}
                 <td className="col-actions">
                   <button className="delete-btn" onClick={() => handleDelete(l.id)}>
                     ✕
@@ -557,17 +783,13 @@ export default function App() {
                   <tr key={`${l.id}-variant-${i}`} className="variant-row">
                     <td className="col-check"></td>
                     <td className="col-img"></td>
-                    <td className="variant-label">{v.label}</td>
-                    <td></td>
-                    <td>
+                    <td className="variant-label" colSpan={12}>
+                      {v.label}
+                      {v.price != null ? ` — $${v.price.toFixed(2)}` : ""}
                       {v.in_stock === false ? (
                         <span className="badge out-of-stock">out of stock</span>
-                      ) : (
-                        "—"
-                      )}
+                      ) : null}
                     </td>
-                    <td>{v.price != null ? `$${v.price.toFixed(2)}` : "—"}</td>
-                    <td></td>
                     <td></td>
                   </tr>
                 ))}
@@ -575,7 +797,7 @@ export default function App() {
           ))}
           {listings.length === 0 && (
             <tr>
-              <td colSpan={8} className="empty">
+              <td colSpan={14} className="empty">
                 No sourced listings yet. Paste a link above to get started.
               </td>
             </tr>
@@ -615,6 +837,74 @@ export default function App() {
                 }
               />
             </label>
+
+            <div className="intl-section">
+              <h3>Markets & International</h3>
+
+              <div className="intl-home">
+                <label className="field-inline">
+                  <span>Home country</span>
+                  <input
+                    type="text"
+                    value={settings.home_country}
+                    maxLength={2}
+                    onChange={(e) =>
+                      saveSettings({ ...settings, home_country: e.target.value.toUpperCase() })
+                    }
+                  />
+                </label>
+                <label className="field-inline">
+                  <span>Currency</span>
+                  <input
+                    type="text"
+                    value={settings.home_currency}
+                    maxLength={3}
+                    onChange={(e) =>
+                      saveSettings({ ...settings, home_currency: e.target.value.toUpperCase() })
+                    }
+                  />
+                </label>
+              </div>
+
+              <label className="field-check">
+                <input
+                  type="checkbox"
+                  checked={settings.international_enabled}
+                  onChange={(e) =>
+                    saveSettings({ ...settings, international_enabled: e.target.checked })
+                  }
+                />
+                <span>Enable international price/availability check</span>
+              </label>
+
+              {settings.international_enabled && (
+                <div className="intl-region">
+                  <div className="intl-region-head">
+                    <strong>EU market</strong>
+                    <span className="intl-region-actions">
+                      <button className="mini-btn" onClick={() => toggleAllEU(true)}>All</button>
+                      <button className="mini-btn" onClick={() => toggleAllEU(false)}>None</button>
+                    </span>
+                  </div>
+                  <div className="intl-countries">
+                    {EU_COUNTRIES.map((code) => (
+                      <label key={code} className="intl-country">
+                        <input
+                          type="checkbox"
+                          checked={settings.check_countries.includes(code)}
+                          onChange={() => toggleCountry(code)}
+                        />
+                        {code}
+                      </label>
+                    ))}
+                  </div>
+                  <p className="intl-note">
+                    Each product you check is fetched once per selected country — more
+                    countries means more API calls and a longer check.
+                  </p>
+                </div>
+              )}
+            </div>
 
             <div className="auth-section">
               <h3>AliExpress Connection</h3>
@@ -700,13 +990,10 @@ export default function App() {
         </div>
       )}
 
-      {/* Detail drawer — no backdrop, so the table stays usable beside it */}
+      {/* Detail drawer — no backdrop, so the table stays usable beside it.
+          Closes on Escape, or by clicking a row / empty table area. */}
       {detailListing && (
         <div className="detail-drawer" onClick={(e) => e.stopPropagation()}>
-          <button className="close-x" onClick={() => { setDetailId(null); setDownloadMsg(null); setCopiedDebug(false); setEditingPrice(false); }}>
-            ✕
-          </button>
-
           <div className="detail-hero">
             {detailListing.images.length > 0 ? (
               <img
@@ -734,7 +1021,22 @@ export default function App() {
           )}
 
           <div className="detail-body">
-            <h2>{detailListing.title}</h2>
+            {detailListing.source_url ? (
+              <h2>
+                <a
+                  className="detail-title-link"
+                  href={detailListing.source_url}
+                  onClick={(e) => {
+                    e.preventDefault();
+                    invoke("open_url", { url: detailListing.source_url }).catch((err) => setError(String(err)));
+                  }}
+                >
+                  {detailListing.title}
+                </a>
+              </h2>
+            ) : (
+              <h2>{detailListing.title}</h2>
+            )}
             <div className="detail-actions">
               {detailListing.source_url && (
                 <button
@@ -754,14 +1056,27 @@ export default function App() {
                   {downloadingImages ? "Downloading…" : "Download images"}
                 </button>
               )}
+              {detailListing.source_url && settings.international_enabled && (
+                <button
+                  className="secondary-btn download-btn"
+                  onClick={runInternational}
+                  disabled={intlBusy}
+                >
+                  {intlBusy ? "Checking…" : "View international prices"}
+                </button>
+              )}
             </div>
             {downloadMsg && <div className="download-msg">{downloadMsg}</div>}
 
             <div className="detail-meta">
               {detailListing.store_name && <div>Store: {detailListing.store_name}</div>}
+              {detailListing.store_rating != null && <div>Store rating: {detailListing.store_rating.toFixed(1)} ★</div>}
+              {detailListing.product_rating != null && detailListing.product_rating > 0 && <div>Rating: {detailListing.product_rating.toFixed(1)} ★</div>}
+              {detailListing.sales_count && <div>Sales: {detailListing.sales_count}</div>}
               {detailListing.brand && <div>Brand: {detailListing.brand}</div>}
               {detailListing.category && <div>Category: {detailListing.category}</div>}
               <div>Warehouse: {detailListing.warehouse ?? "unknown"}</div>
+              <div>Availability: {detailListing.ships === false ? "unavailable in home market" : detailListing.ships === true ? "available" : "unknown"}</div>
 
               <div className="price-line">
                 <span>Price: </span>
@@ -799,14 +1114,45 @@ export default function App() {
               )}
 
               <div>Last fetched: {formatDate(detailListing.last_fetched)}</div>
-              {detailListing.source_url && (
-                <div>
-                  <a href={detailListing.source_url} target="_blank" rel="noreferrer">
-                    View on AliExpress
-                  </a>
-                </div>
-              )}
             </div>
+
+            {intl && (
+              <div className="detail-intl">
+                <h3>International prices</h3>
+                <table className="variant-table">
+                  <thead>
+                    <tr>
+                      <th>Country</th>
+                      <th>Ships</th>
+                      <th>Price</th>
+                      <th>Variants</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {intl.countries.map((c) => (
+                      <tr key={c.country} className={c.ships ? "" : "intl-noship"}>
+                        <td>{c.country}</td>
+                        <td>
+                          {c.error ? (
+                            <span className="badge out-of-stock">error</span>
+                          ) : c.ships ? (
+                            <span className="badge in-stock">yes</span>
+                          ) : (
+                            <span className="badge out-of-stock">no</span>
+                          )}
+                        </td>
+                        <td>
+                          {c.price_min != null
+                            ? `${c.price_min.toFixed(2)}${c.price_max != null && c.price_max !== c.price_min ? `–${c.price_max.toFixed(2)}` : ""} ${c.currency}`
+                            : "—"}
+                        </td>
+                        <td>{c.variants.length || "—"}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
 
             {detailListing.variants.length > 0 && (
               <div className="detail-variants">
@@ -841,14 +1187,11 @@ export default function App() {
             )}
 
             {detailListing.debug_json && (
-              <div className="detail-debug">
-                <div className="detail-debug-head">
-                  <h3>Debug JSON</h3>
-                  <button className="secondary-btn download-btn" onClick={copyDebugJson}>
-                    {copiedDebug ? "Copied" : "Copy"}
-                  </button>
-                </div>
-                <pre className="debug-json">{detailListing.debug_json}</pre>
+              <div className="detail-debug-line">
+                <span>Debug JSON</span>
+                <button className="mini-btn" onClick={copyDebugJson}>
+                  {copiedDebug ? "Copied" : "Copy"}
+                </button>
               </div>
             )}
           </div>
