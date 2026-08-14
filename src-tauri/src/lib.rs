@@ -51,12 +51,18 @@ pub struct Listing {
     pub product_status: Option<String>,
     #[serde(default)]
     pub ships: Option<bool>,
+    #[serde(default)]
+    pub primary_sku_id: Option<String>,
+    #[serde(default)]
+    pub base_price_min: Option<f64>, // account-neutral base (calculation basis)
+    #[serde(default)]
+    pub base_price_max: Option<f64>,
 }
 
 /// Bump this whenever a fetch starts capturing new data. Listings stamped with
 /// a lower version (or none) are considered "outdated" and can be refetched to
 /// bring them up to the current shape.
-pub const CURRENT_DATA_VERSION: i64 = 3;
+pub const CURRENT_DATA_VERSION: i64 = 5;
 
 fn now_unix() -> i64 {
     std::time::SystemTime::now()
@@ -164,6 +170,11 @@ pub struct CountryResult {
     pub currency: String,
     pub variants: Vec<Variant>,
     pub error: Option<String>,
+    // freight (real deliverability) fields
+    pub delivery_company: Option<String>,
+    pub delivery_days: Option<String>,
+    pub free_shipping: Option<bool>,
+    pub freight_msg: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -335,6 +346,9 @@ fn add_manual_listing(state: State<AppState>, title: String, price: f64, stock: 
         sales_count: None,
         product_status: None,
         ships: None,
+        primary_sku_id: None,
+        base_price_min: None,
+        base_price_max: None,
     };
     state.listings.lock().unwrap().push(listing.clone());
     persist_listings(&state);
@@ -358,18 +372,28 @@ fn delete_listing(state: State<AppState>, id: String) -> bool {
 // Python subprocess bridge (ae_client.py / ae_cli.py)
 // ---------------------------------------------------------------------------
 
-/// Locates ae_cli.py. Checks (in order): AE_CLI_PATH env override, the repo's
-/// python/ dir at compile time (dev builds only), then a python/ folder next
-/// to the running executable (release layout). Override via AE_CLI_PATH if
-/// you keep the python/ folder somewhere else.
-fn resolve_script_path() -> PathBuf {
+/// Locates a python script by name (e.g. "ae_cli.py", "ae_freight_cli.py").
+/// Checks (in order): AE_CLI_PATH env override's directory, the repo's python/
+/// dir at compile time (dev builds only), then a python/ folder next to the
+/// running executable (release layout).
+fn resolve_named_script(name: &str) -> PathBuf {
     if let Ok(p) = std::env::var("AE_CLI_PATH") {
-        return PathBuf::from(p);
+        // AE_CLI_PATH points at ae_cli.py; use its directory for siblings.
+        let base = PathBuf::from(&p);
+        if let Some(dir) = base.parent() {
+            let candidate = dir.join(name);
+            if candidate.exists() || name != "ae_cli.py" {
+                return candidate;
+            }
+        }
+        return base;
     }
 
     #[cfg(debug_assertions)]
     {
-        let dev_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../python/ae_cli.py");
+        let dev_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../python")
+            .join(name);
         if dev_path.exists() {
             return dev_path;
         }
@@ -377,29 +401,40 @@ fn resolve_script_path() -> PathBuf {
 
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
-            let p = dir.join("python/ae_cli.py");
+            let p = dir.join("python").join(name);
             if p.exists() {
                 return p;
             }
         }
     }
 
-    PathBuf::from("python/ae_cli.py")
+    PathBuf::from(format!("python/{name}"))
+}
+
+/// Locates ae_cli.py (back-compat wrapper).
+fn resolve_script_path() -> PathBuf {
+    resolve_named_script("ae_cli.py")
 }
 
 fn python_bin() -> String {
     std::env::var("AE_PYTHON_BIN").unwrap_or_else(|_| "python3".to_string())
 }
 
-/// Runs ae_cli.py <input> [country] [currency] and parses its JSON stdout.
-/// Returns the raw parsed JSON value (not yet a Listing).
-async fn fetch_raw(input: &str, country: &str, currency: &str) -> Result<serde_json::Value, String> {
+/// Runs ae_cli.py <input> [country] [currency] [base] and parses its JSON.
+/// When `base` is true, passes the base-price flag (remove_personal_benefit).
+async fn fetch_raw(
+    input: &str,
+    country: &str,
+    currency: &str,
+    base: bool,
+) -> Result<serde_json::Value, String> {
     let script = resolve_script_path();
-    let output = TokioCommand::new(python_bin())
-        .arg(&script)
-        .arg(input)
-        .arg(country)
-        .arg(currency)
+    let mut cmd = TokioCommand::new(python_bin());
+    cmd.arg(&script).arg(input).arg(country).arg(currency);
+    if base {
+        cmd.arg("base");
+    }
+    let output = cmd
         .output()
         .await
         .map_err(|e| format!("failed to run python ({}): {e}", script.display()))?;
@@ -422,15 +457,117 @@ async fn fetch_raw(input: &str, country: &str, currency: &str) -> Result<serde_j
     Ok(json)
 }
 
-/// Fetches and builds a full Listing for the given country/currency.
+fn prices_from_json(json: &serde_json::Value) -> (Option<f64>, Option<f64>) {
+    let prices: Vec<f64> = json
+        .get("prices")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_f64()).collect())
+        .unwrap_or_default();
+    let min = prices
+        .iter()
+        .cloned()
+        .fold(None, |acc: Option<f64>, p| Some(acc.map_or(p, |a| a.min(p))));
+    let max = prices
+        .iter()
+        .cloned()
+        .fold(None, |acc: Option<f64>, p| Some(acc.map_or(p, |a| a.max(p))));
+    (min, max)
+}
+
+/// Fetches and builds a full Listing for the given country/currency. Does a
+/// DOUBLE fetch of the same product id (no sleep between — same id): the
+/// promotional price (default) becomes the listing's price_min/max, and a
+/// second base-price fetch (remove_personal_benefit) fills base_price_min/max,
+/// the account-neutral calculation basis. If a promotion is active the base is
+/// higher than the promo.
 async fn fetch_one_in(input: &str, country: &str, currency: &str) -> Result<Listing, String> {
-    let json = fetch_raw(input, country, currency).await?;
-    parse_product_json(&json, input)
+    // promotional fetch (the price shown / priority)
+    let promo_json = fetch_raw(input, country, currency, false).await?;
+    let mut listing = parse_product_json(&promo_json, input)?;
+
+    // base fetch (calculation basis) — same id, no sleep between
+    match fetch_raw(input, country, currency, true).await {
+        Ok(base_json) => {
+            let (bmin, bmax) = prices_from_json(&base_json);
+            listing.base_price_min = bmin;
+            listing.base_price_max = bmax;
+        }
+        Err(_) => {
+            // base fetch failed — leave base prices None; promo still valid
+        }
+    }
+    Ok(listing)
 }
 
 /// Fetches a Listing using the app's configured home market (country/currency).
 async fn fetch_one(input: &str, home_country: &str, home_currency: &str) -> Result<Listing, String> {
     fetch_one_in(input, home_country, home_currency).await
+}
+
+/// Extracts the numeric product id from a source URL or raw id string, mirroring
+/// the Python _extract_product_id. Falls back to the input trimmed.
+fn extract_product_id(input: &str) -> String {
+    let s = input.trim();
+    // /item/<id>.html
+    if let Some(pos) = s.find("/item/") {
+        let rest = &s[pos + 6..];
+        let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if !digits.is_empty() {
+            return digits;
+        }
+        // may have a locale segment before the id; grab the last long digit run
+    }
+    // longest run of >=8 digits anywhere
+    let mut best = String::new();
+    let mut cur = String::new();
+    for ch in s.chars() {
+        if ch.is_ascii_digit() {
+            cur.push(ch);
+            if cur.len() > best.len() {
+                best = cur.clone();
+            }
+        } else {
+            cur.clear();
+        }
+    }
+    if best.len() >= 8 {
+        return best;
+    }
+    s.to_string()
+}
+
+/// Queries the AE-Freight endpoint (via ae_freight_cli.py) for real per-country
+/// deliverability. Returns the parsed JSON: { ships, code, msg, options: [...] }.
+async fn fetch_freight(
+    product_id: &str,
+    sku_id: &str,
+    country: &str,
+    currency: &str,
+) -> Result<serde_json::Value, String> {
+    let script = resolve_named_script("ae_freight_cli.py");
+    let output = TokioCommand::new(python_bin())
+        .arg(&script)
+        .arg(product_id)
+        .arg(sku_id)
+        .arg(country)
+        .arg(currency)
+        .output()
+        .await
+        .map_err(|e| format!("failed to run freight cli ({}): {e}", script.display()))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stdout_trimmed = stdout.trim();
+    if stdout_trimmed.is_empty() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("freight cli produced no output. stderr: {stderr}"));
+    }
+
+    let json: serde_json::Value = serde_json::from_str(stdout_trimmed)
+        .map_err(|e| format!("failed to parse freight output: {e} (raw: {stdout_trimmed})"))?;
+    if let Some(err) = json.get("error") {
+        return Err(err.as_str().unwrap_or("unknown freight error").to_string());
+    }
+    Ok(json)
 }
 
 fn parse_product_json(json: &serde_json::Value, source_input: &str) -> Result<Listing, String> {
@@ -537,6 +674,10 @@ fn parse_product_json(json: &serde_json::Value, source_input: &str) -> Result<Li
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
     let ships = json.get("ships").and_then(|v| v.as_bool());
+    let primary_sku_id = json
+        .get("primary_sku_id")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
 
     Ok(Listing {
         id: Uuid::new_v4().to_string(),
@@ -563,6 +704,9 @@ fn parse_product_json(json: &serde_json::Value, source_input: &str) -> Result<Li
         sales_count,
         product_status,
         ships,
+        primary_sku_id,
+        base_price_min: None,
+        base_price_max: None,
     })
 }
 
@@ -730,93 +874,140 @@ async fn refetch_many(
     })
 }
 
-/// Checks a product's availability and price across the configured countries.
-/// For each enabled country it fetches the product with that ship-to country
-/// (and appropriate currency) and records whether it ships, the price range,
-/// and the per-country variants. Runs sequentially, respecting the sleep
-/// setting, since it can be many calls.
+/// Checks a product's price and REAL deliverability across the configured
+/// countries. Price comes from ds.product.get (which is accurate per country);
+/// deliverability comes from the AE-Freight endpoint (product.get's ships flag
+/// is unreliable — it reports the product available regardless of destination).
+/// Runs sequentially, respecting the sleep setting.
 #[tauri::command]
 async fn check_international(
     state: State<'_, AppState>,
     id: String,
 ) -> Result<InternationalResult, String> {
-    let source = {
+    let (source, sku_id) = {
         let listings = state.listings.lock().unwrap();
         let existing = listings
             .iter()
             .find(|l| l.id == id)
             .ok_or_else(|| "listing not found".to_string())?;
-        existing
+        let src = existing
             .source_url
             .clone()
-            .ok_or_else(|| "this listing has no source URL".to_string())?
+            .ok_or_else(|| "this listing has no source URL".to_string())?;
+        (src, existing.primary_sku_id.clone())
     };
-    let (countries, sleep_secs, home_currency) = {
+    let (countries, home_currency) = {
         let s = state.settings.lock().unwrap();
         if !s.international_enabled {
             return Err("international check is disabled in settings".to_string());
         }
-        (
-            s.check_countries.clone(),
-            s.sleep_seconds,
-            s.home_currency.clone(),
-        )
+        (s.check_countries.clone(), s.home_currency.clone())
     };
+
+    // product id for freight = the numeric id from the source url / stored input
+    let product_id = extract_product_id(&source);
 
     let mut results = Vec::with_capacity(countries.len());
     for country in countries {
         let currency = currency_for_country(&country, &home_currency);
-        match fetch_raw(source.trim(), &country, &currency).await {
-            Ok(json) => {
-                let ships = json.get("ships").and_then(|v| v.as_bool()).unwrap_or(false);
-                let prices: Vec<f64> = json
-                    .get("prices")
-                    .and_then(|v| v.as_array())
-                    .map(|arr| arr.iter().filter_map(|v| v.as_f64()).collect())
-                    .unwrap_or_default();
-                let price_min = prices.iter().cloned().fold(None, |acc: Option<f64>, p| {
-                    Some(acc.map_or(p, |a| a.min(p)))
-                });
-                let price_max = prices.iter().cloned().fold(None, |acc: Option<f64>, p| {
-                    Some(acc.map_or(p, |a| a.max(p)))
-                });
-                let variants: Vec<Variant> = json
-                    .get("variant_prices")
-                    .and_then(|v| v.as_array())
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|v| {
-                                let label = v.get("variant")?.as_str()?.to_string();
-                                let price = v.get("price").and_then(|p| p.as_f64());
-                                let in_stock = v.get("in_stock").and_then(|p| p.as_bool());
-                                Some(Variant { label, price, in_stock })
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                results.push(CountryResult {
-                    country,
-                    ships,
-                    price_min,
-                    price_max,
-                    currency,
-                    variants,
-                    error: None,
-                });
+
+        // 1) price + variants from product.get (accurate per country)
+        let (price_min, price_max, variants, mut price_err) =
+            match fetch_raw(source.trim(), &country, &currency, false).await {
+                Ok(json) => {
+                    let prices: Vec<f64> = json
+                        .get("prices")
+                        .and_then(|v| v.as_array())
+                        .map(|arr| arr.iter().filter_map(|v| v.as_f64()).collect())
+                        .unwrap_or_default();
+                    let pmin = prices.iter().cloned().fold(None, |acc: Option<f64>, p| {
+                        Some(acc.map_or(p, |a| a.min(p)))
+                    });
+                    let pmax = prices.iter().cloned().fold(None, |acc: Option<f64>, p| {
+                        Some(acc.map_or(p, |a| a.max(p)))
+                    });
+                    let vars: Vec<Variant> = json
+                        .get("variant_prices")
+                        .and_then(|v| v.as_array())
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|v| {
+                                    let label = v.get("variant")?.as_str()?.to_string();
+                                    let price = v.get("price").and_then(|p| p.as_f64());
+                                    let in_stock = v.get("in_stock").and_then(|p| p.as_bool());
+                                    Some(Variant { label, price, in_stock })
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    (pmin, pmax, vars, None)
+                }
+                Err(e) => (None, None, vec![], Some(e)),
+            };
+
+        // 2) REAL deliverability from freight
+        let mut ships = false;
+        let mut delivery_company = None;
+        let mut delivery_days = None;
+        let mut free_shipping = None;
+        let mut freight_msg = None;
+
+        if let Some(sku) = sku_id.as_deref() {
+            match fetch_freight(&product_id, sku, &country, &currency).await {
+                Ok(fjson) => {
+                    ships = fjson.get("ships").and_then(|v| v.as_bool()).unwrap_or(false);
+                    freight_msg = fjson
+                        .get("msg")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+                    if let Some(opts) = fjson.get("options").and_then(|v| v.as_array()) {
+                        if let Some(first) = opts.first() {
+                            delivery_company = first
+                                .get("company")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string());
+                            free_shipping =
+                                first.get("free_shipping").and_then(|v| v.as_bool());
+                            let min_d = first.get("min_days").and_then(|v| v.as_i64());
+                            let max_d = first.get("max_days").and_then(|v| v.as_i64());
+                            delivery_days = match (min_d, max_d) {
+                                (Some(a), Some(b)) => Some(format!("{a}–{b} days")),
+                                (Some(a), None) => Some(format!("{a}+ days")),
+                                _ => first
+                                    .get("delivery_date_desc")
+                                    .and_then(|v| v.as_str())
+                                    .map(|s| s.to_string()),
+                            };
+                        }
+                    }
+                }
+                Err(e) => {
+                    // freight failed hard (not a "can't ship" answer, an actual error)
+                    if price_err.is_none() {
+                        price_err = Some(format!("freight: {e}"));
+                    }
+                }
             }
-            Err(e) => {
-                results.push(CountryResult {
-                    country,
-                    ships: false,
-                    price_min: None,
-                    price_max: None,
-                    currency,
-                    variants: vec![],
-                    error: Some(e),
-                });
-            }
+        } else {
+            freight_msg = Some("no SKU id — refetch this listing to enable freight".to_string());
         }
-        sleep(Duration::from_secs_f64(sleep_secs)).await;
+
+        // No sleep here: the international sweep is all one product id, and the
+        // rule is sleep only between DIFFERENT product ids.
+
+        results.push(CountryResult {
+            country,
+            ships,
+            price_min,
+            price_max,
+            currency,
+            variants,
+            error: price_err,
+            delivery_company,
+            delivery_days,
+            free_shipping,
+            freight_msg,
+        });
     }
 
     Ok(InternationalResult { id, countries: results })
