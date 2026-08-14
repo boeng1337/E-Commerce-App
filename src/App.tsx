@@ -65,6 +65,8 @@ export default function App() {
   const [detailListing, setDetailListing] = useState<Listing | null>(null);
   const [downloadingImages, setDownloadingImages] = useState(false);
   const [downloadMsg, setDownloadMsg] = useState<string | null>(null);
+  const [copiedDebug, setCopiedDebug] = useState(false);
+  const [refetching, setRefetching] = useState(false);
 
   const [authStatus, setAuthStatus] = useState<AuthStatus | null>(null);
   const [redirectUri, setRedirectUri] = useState("");
@@ -184,15 +186,30 @@ export default function App() {
     }
   }
 
-  function downloadDebugJson() {
+  async function copyDebugJson() {
     if (!detailListing?.debug_json) return;
-    const blob = new Blob([detailListing.debug_json], { type: "application/json" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = `${detailListing.id}.json`;
-    a.click();
-    URL.revokeObjectURL(url);
+    try {
+      await navigator.clipboard.writeText(detailListing.debug_json);
+      setCopiedDebug(true);
+      setTimeout(() => setCopiedDebug(false), 1500);
+    } catch (e) {
+      setDownloadMsg(String(e));
+    }
+  }
+
+  async function handleRefetch() {
+    if (!detailListing) return;
+    setRefetching(true);
+    setDownloadMsg(null);
+    try {
+      const updated = await invoke<Listing>("refetch_listing", { id: detailListing.id });
+      setDetailListing(updated);
+      await refresh();
+    } catch (e) {
+      setDownloadMsg(String(e));
+    } finally {
+      setRefetching(false);
+    }
   }
 
   async function handleDownloadImages() {
@@ -511,9 +528,9 @@ export default function App() {
       )}
 
       {detailListing && (
-        <div className="detail-backdrop" onClick={() => { setDetailListing(null); setDownloadMsg(null); }}>
+        <div className="detail-backdrop" onClick={() => { setDetailListing(null); setDownloadMsg(null); setCopiedDebug(false); }}>
           <div className="detail-drawer" onClick={(e) => e.stopPropagation()}>
-            <button className="close-x" onClick={() => { setDetailListing(null); setDownloadMsg(null); }}>
+            <button className="close-x" onClick={() => { setDetailListing(null); setDownloadMsg(null); setCopiedDebug(false); }}>
               ✕
             </button>
             <div className="detail-images">
@@ -527,20 +544,27 @@ export default function App() {
             </div>
             <div className="detail-body">
               <h2>{detailListing.title}</h2>
-              {detailListing.images.length > 0 && (
-                <div className="detail-download">
+              <div className="detail-actions">
+                {detailListing.source_url && (
+                  <button
+                    className="secondary-btn download-btn"
+                    onClick={handleRefetch}
+                    disabled={refetching}
+                  >
+                    {refetching ? "Refetching…" : "Refetch data"}
+                  </button>
+                )}
+                {detailListing.images.length > 0 && (
                   <button
                     className="secondary-btn download-btn"
                     onClick={handleDownloadImages}
                     disabled={downloadingImages}
                   >
-                    {downloadingImages
-                      ? "Downloading…"
-                      : `Download ${detailListing.images.length} image${detailListing.images.length === 1 ? "" : "s"}`}
+                    {downloadingImages ? "Downloading…" : "Download images"}
                   </button>
-                  {downloadMsg && <div className="download-msg">{downloadMsg}</div>}
-                </div>
-              )}
+                )}
+              </div>
+              {downloadMsg && <div className="download-msg">{downloadMsg}</div>}
               <div className="detail-meta">
                 {detailListing.store_name && <div>Store: {detailListing.store_name}</div>}
                 {detailListing.brand && <div>Brand: {detailListing.brand}</div>}
@@ -591,8 +615,8 @@ export default function App() {
                 <div className="detail-debug">
                   <div className="detail-debug-head">
                     <h3>Debug JSON</h3>
-                    <button className="secondary-btn download-btn" onClick={downloadDebugJson}>
-                      Download
+                    <button className="secondary-btn download-btn" onClick={copyDebugJson}>
+                      {copiedDebug ? "Copied" : "Copy"}
                     </button>
                   </div>
                   <pre className="debug-json">{detailListing.debug_json}</pre>

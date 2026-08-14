@@ -386,8 +386,11 @@ th {
   padding-top: 16px;
 }
 
-.detail-download {
+.detail-actions {
+  display: flex;
+  gap: 8px;
   margin-bottom: 16px;
+  flex-wrap: wrap;
 }
 
 .download-msg {
