@@ -32,6 +32,9 @@ type Listing = {
   sales_count: string | null;
   product_status: string | null;
   ships: boolean | null;
+  primary_sku_id: string | null;
+  base_price_min: number | null;
+  base_price_max: number | null;
 };
 
 type Settings = {
@@ -54,6 +57,10 @@ type CountryResult = {
   currency: string;
   variants: Variant[];
   error: string | null;
+  delivery_company: string | null;
+  delivery_days: string | null;
+  free_shipping: boolean | null;
+  freight_msg: string | null;
 };
 
 type InternationalResult = {
@@ -97,7 +104,7 @@ type AuthStatus = {
 };
 
 // Must match CURRENT_DATA_VERSION in src-tauri/src/lib.rs
-const CURRENT_DATA_VERSION = 2;
+const CURRENT_DATA_VERSION = 5;
 
 function formatPrice(min: number | null, max: number | null): string {
   if (min == null && max == null) return "—";
@@ -110,6 +117,16 @@ function formatPrice(min: number | null, max: number | null): string {
 function displayPrice(l: Listing): string {
   if (l.price_override != null) return `$${l.price_override.toFixed(2)}`;
   return formatPrice(l.price_min, l.price_max);
+}
+
+// A promotion is active when the account-neutral base price is meaningfully
+// higher than the current (promotional) price. Returns the discount % or null.
+function promotionDiscount(l: Listing): number | null {
+  const promo = l.price_min;
+  const base = l.base_price_min;
+  if (promo == null || base == null) return null;
+  if (base <= promo) return null;
+  return Math.round(((base - promo) / base) * 100);
 }
 
 function isOutdated(l: Listing): boolean {
@@ -637,23 +654,32 @@ export default function App() {
       {error && <div className="error">{error}</div>}
 
       <div className="toolbar">
-        <button className="ghost-btn" onClick={() => setColumnsOpen((v) => !v)}>
-          Columns ▾
-        </button>
-        {columnsOpen && (
-          <div className="columns-menu">
-            {ALL_COLUMNS.map((c) => (
-              <label key={c.key} className="columns-item">
-                <input
-                  type="checkbox"
-                  checked={isColVisible(c.key)}
-                  onChange={() => toggleColumn(c.key)}
-                />
-                {c.label}
-              </label>
-            ))}
-          </div>
-        )}
+        <div className="columns-wrap">
+          <button className="ghost-btn" onClick={() => setColumnsOpen((v) => !v)}>
+            Columns ▾
+          </button>
+          {columnsOpen && (
+            <>
+              <div className="columns-catcher" onClick={() => setColumnsOpen(false)} />
+              <div className="columns-menu">
+                <div className="columns-menu-head">
+                  <span>Show columns</span>
+                  <button className="mini-btn" onClick={() => setColumnsOpen(false)}>Done</button>
+                </div>
+                {ALL_COLUMNS.map((c) => (
+                  <label key={c.key} className="columns-item">
+                    <input
+                      type="checkbox"
+                      checked={isColVisible(c.key)}
+                      onChange={() => toggleColumn(c.key)}
+                    />
+                    {c.label}
+                  </label>
+                ))}
+              </div>
+            </>
+          )}
+        </div>
         {outdatedCount > 0 && (
           <button className="warn-btn" onClick={fetchAllOutdated} disabled={busy}>
             {outdatedCount} outdated — Refetch all
@@ -728,7 +754,14 @@ export default function App() {
                 </td>
                 {isColVisible("category") && <td>{l.category ?? "—"}</td>}
                 {isColVisible("warehouse") && <td>{l.warehouse ?? "—"}</td>}
-                {isColVisible("price") && <td>{displayPrice(l)}</td>}
+                {isColVisible("price") && (
+                  <td>
+                    {displayPrice(l)}
+                    {promotionDiscount(l) != null && l.price_override == null && (
+                      <span className="badge promo">-{promotionDiscount(l)}%</span>
+                    )}
+                  </td>
+                )}
                 {isColVisible("stock") && (
                   <td className={stockLabel(l) === "unavailable" || stockLabel(l) === "no shipping" ? "stock-bad" : ""}>
                     {stockLabel(l)}
@@ -1057,7 +1090,20 @@ export default function App() {
                   </span>
                 ) : (
                   <span>
-                    {displayPrice(detailListing)}
+                    {(() => {
+                      const disc = promotionDiscount(detailListing);
+                      return disc != null && detailListing.price_override == null ? (
+                        <>
+                          <span className="price-base-strike">
+                            {formatPrice(detailListing.base_price_min, detailListing.base_price_max)}
+                          </span>{" "}
+                          <span className="price-promo">{displayPrice(detailListing)}</span>{" "}
+                          <span className="badge promo">-{disc}%</span>
+                        </>
+                      ) : (
+                        displayPrice(detailListing)
+                      );
+                    })()}
                     {detailListing.price_override != null && (
                       <span className="badge edited">manual</span>
                     )}
@@ -1071,20 +1117,23 @@ export default function App() {
               {detailListing.price_override != null && (
                 <div className="price-sub">API price: {formatPrice(detailListing.price_min, detailListing.price_max)}</div>
               )}
+              {detailListing.base_price_min != null && promotionDiscount(detailListing) == null && detailListing.price_override == null && (
+                <div className="price-sub">Base price (calc. basis): {formatPrice(detailListing.base_price_min, detailListing.base_price_max)}</div>
+              )}
 
               <div>Last fetched: {formatDate(detailListing.last_fetched)}</div>
             </div>
 
             {intl && (
               <div className="detail-intl">
-                <h3>International prices</h3>
+                <h3>International prices & shipping</h3>
                 <table className="variant-table">
                   <thead>
                     <tr>
                       <th>Country</th>
                       <th>Ships</th>
                       <th>Price</th>
-                      <th>Variants</th>
+                      <th>Delivery</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -1093,11 +1142,11 @@ export default function App() {
                         <td>{c.country}</td>
                         <td>
                           {c.error ? (
-                            <span className="badge out-of-stock">error</span>
+                            <span className="badge out-of-stock" title={c.error}>error</span>
                           ) : c.ships ? (
                             <span className="badge in-stock">yes</span>
                           ) : (
-                            <span className="badge out-of-stock">no</span>
+                            <span className="badge out-of-stock" title={c.freight_msg ?? ""}>no</span>
                           )}
                         </td>
                         <td>
@@ -1105,11 +1154,26 @@ export default function App() {
                             ? `${c.price_min.toFixed(2)}${c.price_max != null && c.price_max !== c.price_min ? `–${c.price_max.toFixed(2)}` : ""} ${c.currency}`
                             : "—"}
                         </td>
-                        <td>{c.variants.length || "—"}</td>
+                        <td className="intl-delivery">
+                          {c.ships ? (
+                            <>
+                              {c.free_shipping ? "Free" : ""}
+                              {c.delivery_company ? ` ${c.delivery_company}` : ""}
+                              {c.delivery_days ? ` · ${c.delivery_days}` : ""}
+                              {!c.delivery_company && !c.delivery_days ? "—" : ""}
+                            </>
+                          ) : (
+                            "—"
+                          )}
+                        </td>
                       </tr>
                     ))}
                   </tbody>
                 </table>
+                <p className="intl-note">
+                  Availability comes from the freight endpoint (real per-country
+                  deliverability). Price comes from the product API.
+                </p>
               </div>
             )}
 
