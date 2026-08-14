@@ -15,20 +15,6 @@ Credentials come from config.py (the gitignored api_keys.env).
 import config
 
 
-def _debug_log(pid, resp, parsed):
-    """Write the raw API response + what we parsed to api_debug/<pid>.json so
-    parsing issues are inspectable. Overwrites per product id."""
-    import json, os
-    try:
-        d = os.path.join(os.path.dirname(__file__), "api_debug")
-        os.makedirs(d, exist_ok=True)
-        with open(os.path.join(d, f"{pid}.json"), "w", encoding="utf-8") as f:
-            json.dump({"parsed": {k: v for k, v in parsed.items() if k != "_raw"},
-                       "raw": resp}, f, ensure_ascii=False, indent=2)
-    except Exception:
-        pass
-
-
 # SKU property names that are actually the ship-from location, not a real
 # variant dimension — extracted as warehouse instead of folded into the label.
 _SHIP_PROPERTY_HINTS = ("ship", "expéd", "exped", "envío", "envio",
@@ -343,5 +329,4 @@ def fetch_product(url_or_id):
         "brand": brand,
         "_raw": resp,
     }
-    _debug_log(pid, resp, parsed)
     return parsed
