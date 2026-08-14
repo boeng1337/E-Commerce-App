@@ -10,20 +10,45 @@ care which one it's talking to.
 import os
 
 
-def _app_folder():
-    """The one shared app folder: ~/Documents/AliExpress Manager.
-    Keeps credentials in the same place as the product list and image
-    dossiers written by the Rust side. Falls back to this file's own
-    directory if the Documents folder can't be determined."""
+def _xdg_documents_dir():
+    """Read the XDG documents dir from ~/.config/user-dirs.dirs if present, so
+    this matches Rust's dirs::document_dir(). Returns None if not configured."""
     home = os.path.expanduser("~")
-    docs = os.path.join(home, "Documents")
-    if os.path.isdir(docs):
+    cfg = os.path.join(home, ".config", "user-dirs.dirs")
+    try:
+        with open(cfg, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("XDG_DOCUMENTS_DIR"):
+                    # e.g. XDG_DOCUMENTS_DIR="$HOME/Documents"
+                    val = line.split("=", 1)[1].strip().strip('"')
+                    val = val.replace("$HOME", home)
+                    if val:
+                        return val
+    except OSError:
+        pass
+    return None
+
+
+def _app_folder():
+    """The one shared app folder: <Documents>/AliExpress Manager.
+    Keeps credentials in the same place as the product list and image dossiers
+    written by the Rust side. Resolution order matches Rust: XDG documents dir,
+    then ~/Documents, then $HOME/Documents. Only falls back to this file's own
+    directory if no home can be found at all."""
+    home = os.path.expanduser("~")
+    candidates = []
+    xdg = _xdg_documents_dir()
+    if xdg:
+        candidates.append(xdg)
+    candidates.append(os.path.join(home, "Documents"))
+    for docs in candidates:
         folder = os.path.join(docs, "AliExpress Manager")
         try:
             os.makedirs(folder, exist_ok=True)
             return folder
         except OSError:
-            pass
+            continue
     return os.path.dirname(__file__)
 
 

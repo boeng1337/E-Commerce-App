@@ -202,17 +202,21 @@ def fetch_product(url_or_id, ship_to_country="FR", target_currency="EUR",
     sales_count = base.get("sales_count")  # e.g. "600+" or "71" — keep as string
     product_status = base.get("product_status_type")
 
-    # brand — often in the property list; useful for auto-tagging
+    # brand — often in the property list; useful for auto-tagging.
+    # Also grab a human-readable category name from the properties (the API's
+    # top-level category_id is just a number); fall back to the numeric id.
     brand = None
+    category_name = None
     prop_wrap = result.get("ae_item_properties", {}) or {}
     prop_list = prop_wrap.get("ae_item_property", []) or []
     if isinstance(prop_list, dict):
         prop_list = [prop_list]
     for pr in prop_list:
         pname = str(pr.get("attr_name") or "").lower()
-        if "brand" in pname or "marque" in pname:
+        if brand is None and ("brand" in pname or "marque" in pname):
             brand = pr.get("attr_value")
-            break
+        if category_name is None and (pname == "category" or "catégorie" in pname or "categorie" in pname):
+            category_name = pr.get("attr_value")
 
     # main images: try known fields, then fall back to scanning the whole
     # response for any alicdn image URLs (field names vary by product).
@@ -362,7 +366,7 @@ def fetch_product(url_or_id, ship_to_country="FR", target_currency="EUR",
         "sales_count": sales_count,
         "product_status": product_status,
         "ships": ships,
-        "api_category_id": category_id_api,
+        "api_category_id": category_name or category_id_api,
         "brand": brand,
         "_raw": resp,
     }
