@@ -389,6 +389,40 @@ async fn search_one(state: State<'_, AppState>, input: String) -> Result<Listing
     Ok(listing)
 }
 
+/// Re-fetches an existing listing from the API and replaces it in place,
+/// preserving its id and position in the list. Uses the stored source_url
+/// (the product URL/ID) as the fetch input. Manual listings, which have no
+/// source_url, can't be refetched.
+#[tauri::command]
+async fn refetch_listing(state: State<'_, AppState>, id: String) -> Result<Listing, String> {
+    let source = {
+        let listings = state.listings.lock().unwrap();
+        let existing = listings
+            .iter()
+            .find(|l| l.id == id)
+            .ok_or_else(|| "listing not found".to_string())?;
+        existing
+            .source_url
+            .clone()
+            .ok_or_else(|| "this listing has no source URL to refetch".to_string())?
+    };
+
+    let mut fresh = fetch_one(source.trim()).await?;
+    // keep the original id so references (selection, detail view) stay valid
+    fresh.id = id.clone();
+
+    {
+        let mut listings = state.listings.lock().unwrap();
+        if let Some(slot) = listings.iter_mut().find(|l| l.id == id) {
+            *slot = fresh.clone();
+        } else {
+            return Err("listing disappeared during refetch".to_string());
+        }
+    }
+    persist_listings(&state);
+    Ok(fresh)
+}
+
 /// Searches many URLs/IDs (one per line of `input`), respecting the current
 /// concurrency limit (max simultaneous python processes) and sleep-between-
 /// searches setting from Settings.
@@ -671,6 +705,7 @@ pub fn run() {
             delete_listing,
             search_one,
             search_bulk,
+            refetch_listing,
             download_images,
             get_settings,
             set_settings,
