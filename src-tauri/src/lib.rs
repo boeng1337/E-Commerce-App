@@ -30,6 +30,7 @@ pub struct Listing {
     pub source_url: Option<String>,
     pub store_name: Option<String>,
     pub brand: Option<String>,
+    pub debug_json: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -61,10 +62,52 @@ pub struct BulkSearchResult {
     pub errors: Vec<String>, // "input: error message"
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct DownloadResult {
+    pub folder: String,
+    pub saved: usize,
+    pub errors: Vec<String>,
+}
+
 pub struct AppState {
     pub listings: Mutex<Vec<Listing>>,
     pub settings: Mutex<Settings>,
     pub settings_path: Mutex<PathBuf>,
+    pub listings_path: Mutex<PathBuf>,
+}
+
+// ---------------------------------------------------------------------------
+// App folder: ~/Documents/AliExpress Manager — one place for everything
+// (product list, credentials, downloaded image dossiers).
+// ---------------------------------------------------------------------------
+
+fn app_folder() -> PathBuf {
+    let docs = dirs::document_dir().unwrap_or_else(|| PathBuf::from("."));
+    let dir = docs.join("AliExpress Manager");
+    let _ = std::fs::create_dir_all(&dir);
+    dir
+}
+
+/// Sanitises a listing title into a safe folder name: strips path separators
+/// and characters illegal on common filesystems, collapses whitespace, and
+/// truncates to a conservative length so the full path stays well under OS
+/// limits.
+fn safe_folder_name(title: &str) -> String {
+    let cleaned: String = title
+        .chars()
+        .map(|c| match c {
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' | '\n' | '\r' | '\t' => ' ',
+            _ => c,
+        })
+        .collect();
+    let collapsed = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
+    let trimmed: String = collapsed.chars().take(80).collect();
+    let out = trimmed.trim().to_string();
+    if out.is_empty() {
+        "untitled".to_string()
+    } else {
+        out
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -86,6 +129,34 @@ fn save_settings(path: &PathBuf, settings: &Settings) {
     if let Ok(json) = serde_json::to_string_pretty(settings) {
         let _ = std::fs::write(path, json);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Listings persistence — listings.json survives exit/re-enter
+// ---------------------------------------------------------------------------
+
+fn load_listings(path: &PathBuf) -> Vec<Listing> {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<Vec<Listing>>(&s).ok())
+        .unwrap_or_default()
+}
+
+fn save_listings(path: &PathBuf, listings: &[Listing]) {
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(json) = serde_json::to_string_pretty(listings) {
+        let _ = std::fs::write(path, json);
+    }
+}
+
+/// Persists the current in-memory listings to disk. Call after every mutation
+/// so the product list is always current on next launch.
+fn persist_listings(state: &AppState) {
+    let listings = state.listings.lock().unwrap().clone();
+    let path = state.listings_path.lock().unwrap().clone();
+    save_listings(&path, &listings);
 }
 
 #[tauri::command]
@@ -127,8 +198,10 @@ fn add_manual_listing(state: State<AppState>, title: String, price: f64, stock: 
         source_url: None,
         store_name: None,
         brand: None,
+        debug_json: None,
     };
     state.listings.lock().unwrap().push(listing.clone());
+    persist_listings(&state);
     listing
 }
 
@@ -137,7 +210,12 @@ fn delete_listing(state: State<AppState>, id: String) -> bool {
     let mut listings = state.listings.lock().unwrap();
     let before = listings.len();
     listings.retain(|l| l.id != id);
-    listings.len() != before
+    let changed = listings.len() != before;
+    drop(listings);
+    if changed {
+        persist_listings(&state);
+    }
+    changed
 }
 
 // ---------------------------------------------------------------------------
@@ -280,6 +358,10 @@ fn parse_product_json(json: &serde_json::Value, source_input: &str) -> Result<Li
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
+    let debug_json = json
+        .get("_raw")
+        .map(|v| serde_json::to_string_pretty(v).unwrap_or_default());
+
     Ok(Listing {
         id: Uuid::new_v4().to_string(),
         title: name,
@@ -294,6 +376,7 @@ fn parse_product_json(json: &serde_json::Value, source_input: &str) -> Result<Li
         source_url,
         store_name,
         brand,
+        debug_json,
     })
 }
 
@@ -302,6 +385,7 @@ fn parse_product_json(json: &serde_json::Value, source_input: &str) -> Result<Li
 async fn search_one(state: State<'_, AppState>, input: String) -> Result<Listing, String> {
     let listing = fetch_one(input.trim()).await?;
     state.listings.lock().unwrap().push(listing.clone());
+    persist_listings(&state);
     Ok(listing)
 }
 
@@ -358,8 +442,70 @@ async fn search_bulk(
     }
 
     state.listings.lock().unwrap().extend(new_listings);
+    persist_listings(&state);
 
     Ok(BulkSearchResult { added, errors })
+}
+
+/// Downloads a listing's images into ~/Documents/AliExpress Manager/<title>/
+/// as 1.jpg, 2.jpg, … in the order they appear on the listing. Returns the
+/// folder path and how many saved. Determines each image's extension from its
+/// URL, defaulting to .jpg.
+#[tauri::command]
+async fn download_images(state: State<'_, AppState>, id: String) -> Result<DownloadResult, String> {
+    let listing = {
+        let listings = state.listings.lock().unwrap();
+        listings
+            .iter()
+            .find(|l| l.id == id)
+            .cloned()
+            .ok_or_else(|| "listing not found".to_string())?
+    };
+
+    if listing.images.is_empty() {
+        return Err("this listing has no images".to_string());
+    }
+
+    let folder = app_folder().join(safe_folder_name(&listing.title));
+    std::fs::create_dir_all(&folder)
+        .map_err(|e| format!("could not create folder {}: {e}", folder.display()))?;
+
+    let client = reqwest::Client::new();
+    let mut saved = 0usize;
+    let mut errors = Vec::new();
+
+    for (i, url) in listing.images.iter().enumerate() {
+        let ext = url
+            .rsplit('/')
+            .next()
+            .and_then(|seg| seg.rsplit('.').next())
+            .map(|e| e.split(['?', '#']).next().unwrap_or(e))
+            .filter(|e| e.len() <= 5 && e.chars().all(|c| c.is_ascii_alphanumeric()))
+            .unwrap_or("jpg");
+        let filename = format!("{}.{}", i + 1, ext);
+        let dest = folder.join(&filename);
+
+        match client.get(url).send().await {
+            Ok(resp) if resp.status().is_success() => match resp.bytes().await {
+                Ok(bytes) => {
+                    if let Err(e) = std::fs::write(&dest, &bytes) {
+                        errors.push(format!("{filename}: write failed: {e}"));
+                    } else {
+                        saved += 1;
+                    }
+                }
+                Err(e) => errors.push(format!("{filename}: read failed: {e}")),
+            },
+            Ok(resp) => errors.push(format!("{filename}: HTTP {}", resp.status())),
+            Err(e) => errors.push(format!("{filename}: request failed: {e}")),
+        }
+    }
+
+    Ok(DownloadResult {
+        folder: folder.display().to_string(),
+        saved,
+        errors,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -505,17 +651,17 @@ async fn has_ae_credentials() -> Result<bool, String> {
 pub fn run() {
     tauri::Builder::default()
         .setup(|app| {
-            let settings_path = app
-                .path()
-                .app_data_dir()
-                .unwrap_or_else(|_| PathBuf::from("."))
-                .join("settings.json");
+            let folder = app_folder();
+            let settings_path = folder.join("settings.json");
+            let listings_path = folder.join("listings.json");
             let settings = load_settings(&settings_path);
+            let listings = load_listings(&listings_path);
 
             app.manage(AppState {
-                listings: Mutex::new(vec![]),
+                listings: Mutex::new(listings),
                 settings: Mutex::new(settings),
                 settings_path: Mutex::new(settings_path),
+                listings_path: Mutex::new(listings_path),
             });
             Ok(())
         })
@@ -525,6 +671,7 @@ pub fn run() {
             delete_listing,
             search_one,
             search_bulk,
+            download_images,
             get_settings,
             set_settings,
             get_auth_status,
