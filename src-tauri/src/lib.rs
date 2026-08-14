@@ -31,6 +31,26 @@ pub struct Listing {
     pub store_name: Option<String>,
     pub brand: Option<String>,
     pub debug_json: Option<String>,
+    #[serde(default)]
+    pub category: Option<String>,
+    #[serde(default)]
+    pub data_version: Option<i64>,
+    #[serde(default)]
+    pub last_fetched: Option<i64>, // Unix seconds
+    #[serde(default)]
+    pub price_override: Option<f64>, // manual edit, protected from refetch
+}
+
+/// Bump this whenever a fetch starts capturing new data. Listings stamped with
+/// a lower version (or none) are considered "outdated" and can be refetched to
+/// bring them up to the current shape.
+pub const CURRENT_DATA_VERSION: i64 = 2;
+
+fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -199,6 +219,10 @@ fn add_manual_listing(state: State<AppState>, title: String, price: f64, stock: 
         store_name: None,
         brand: None,
         debug_json: None,
+        category: None,
+        data_version: Some(CURRENT_DATA_VERSION),
+        last_fetched: Some(now_unix()),
+        price_override: None,
     };
     state.listings.lock().unwrap().push(listing.clone());
     persist_listings(&state);
@@ -362,6 +386,17 @@ fn parse_product_json(json: &serde_json::Value, source_input: &str) -> Result<Li
         .get("_raw")
         .map(|v| serde_json::to_string_pretty(v).unwrap_or_default());
 
+    // category comes from Python as api_category_id (may be a number or string)
+    let category = json.get("api_category_id").and_then(|v| {
+        if let Some(s) = v.as_str() {
+            Some(s.to_string())
+        } else if let Some(n) = v.as_i64() {
+            Some(n.to_string())
+        } else {
+            None
+        }
+    });
+
     Ok(Listing {
         id: Uuid::new_v4().to_string(),
         title: name,
@@ -377,6 +412,10 @@ fn parse_product_json(json: &serde_json::Value, source_input: &str) -> Result<Li
         store_name,
         brand,
         debug_json,
+        category,
+        data_version: Some(CURRENT_DATA_VERSION),
+        last_fetched: Some(now_unix()),
+        price_override: None,
     })
 }
 
@@ -390,26 +429,35 @@ async fn search_one(state: State<'_, AppState>, input: String) -> Result<Listing
 }
 
 /// Re-fetches an existing listing from the API and replaces it in place,
-/// preserving its id and position in the list. Uses the stored source_url
-/// (the product URL/ID) as the fetch input. Manual listings, which have no
+/// preserving its id and position in the list. The manual price override is
+/// preserved by default (protected from refetch); pass release_override=true
+/// to drop it and let the API price win. Manual listings, which have no
 /// source_url, can't be refetched.
 #[tauri::command]
-async fn refetch_listing(state: State<'_, AppState>, id: String) -> Result<Listing, String> {
-    let source = {
+async fn refetch_listing(
+    state: State<'_, AppState>,
+    id: String,
+    release_override: Option<bool>,
+) -> Result<Listing, String> {
+    let (source, prior_override) = {
         let listings = state.listings.lock().unwrap();
         let existing = listings
             .iter()
             .find(|l| l.id == id)
             .ok_or_else(|| "listing not found".to_string())?;
-        existing
+        let src = existing
             .source_url
             .clone()
-            .ok_or_else(|| "this listing has no source URL to refetch".to_string())?
+            .ok_or_else(|| "this listing has no source URL to refetch".to_string())?;
+        (src, existing.price_override)
     };
 
     let mut fresh = fetch_one(source.trim()).await?;
-    // keep the original id so references (selection, detail view) stay valid
     fresh.id = id.clone();
+    // keep the manual price override unless the caller explicitly releases it
+    if release_override != Some(true) {
+        fresh.price_override = prior_override;
+    }
 
     {
         let mut listings = state.listings.lock().unwrap();
@@ -421,6 +469,107 @@ async fn refetch_listing(state: State<'_, AppState>, id: String) -> Result<Listi
     }
     persist_listings(&state);
     Ok(fresh)
+}
+
+/// True if a listing is behind the current data version or missing core data
+/// (no price and no images) — i.e. "not correctly fetched" / outdated.
+fn is_outdated(l: &Listing) -> bool {
+    if l.source != "aliexpress" {
+        return false; // manual listings are never "outdated"
+    }
+    let behind_version = l.data_version.unwrap_or(0) < CURRENT_DATA_VERSION;
+    let missing_core = l.price_min.is_none() && l.images.is_empty();
+    behind_version || missing_core
+}
+
+/// Returns the ids of all listings considered outdated.
+#[tauri::command]
+fn get_outdated_ids(state: State<AppState>) -> Vec<String> {
+    state
+        .listings
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|l| is_outdated(l))
+        .map(|l| l.id.clone())
+        .collect()
+}
+
+/// Sets (or clears, with null) the manual price override for a listing.
+#[tauri::command]
+fn set_price_override(
+    state: State<AppState>,
+    id: String,
+    price: Option<f64>,
+) -> Result<Listing, String> {
+    let mut listings = state.listings.lock().unwrap();
+    let slot = listings
+        .iter_mut()
+        .find(|l| l.id == id)
+        .ok_or_else(|| "listing not found".to_string())?;
+    slot.price_override = price;
+    let updated = slot.clone();
+    drop(listings);
+    persist_listings(&state);
+    Ok(updated)
+}
+
+/// Refetches many listings by id, sequentially, respecting the sleep setting.
+/// `release_ids` lists the ids whose manual price override should be dropped;
+/// all others keep their override. Returns how many succeeded and any errors.
+#[tauri::command]
+async fn refetch_many(
+    state: State<'_, AppState>,
+    ids: Vec<String>,
+    release_ids: Option<Vec<String>>,
+) -> Result<BulkSearchResult, String> {
+    let release: std::collections::HashSet<String> =
+        release_ids.unwrap_or_default().into_iter().collect();
+    let sleep_secs = state.settings.lock().unwrap().sleep_seconds;
+
+    let mut updated = 0usize;
+    let mut errors = Vec::new();
+
+    for id in ids {
+        let (source, prior_override) = {
+            let listings = state.listings.lock().unwrap();
+            match listings.iter().find(|l| l.id == id) {
+                Some(l) => match l.source_url.clone() {
+                    Some(src) => (src, l.price_override),
+                    None => {
+                        errors.push(format!("{id}: no source URL"));
+                        continue;
+                    }
+                },
+                None => {
+                    errors.push(format!("{id}: not found"));
+                    continue;
+                }
+            }
+        };
+
+        match fetch_one(source.trim()).await {
+            Ok(mut fresh) => {
+                fresh.id = id.clone();
+                if !release.contains(&id) {
+                    fresh.price_override = prior_override;
+                }
+                let mut listings = state.listings.lock().unwrap();
+                if let Some(slot) = listings.iter_mut().find(|l| l.id == id) {
+                    *slot = fresh;
+                    updated += 1;
+                }
+            }
+            Err(e) => errors.push(format!("{id}: {e}")),
+        }
+        sleep(Duration::from_secs_f64(sleep_secs)).await;
+    }
+
+    persist_listings(&state);
+    Ok(BulkSearchResult {
+        added: updated,
+        errors,
+    })
 }
 
 /// Searches many URLs/IDs (one per line of `input`), respecting the current
@@ -706,6 +855,9 @@ pub fn run() {
             search_one,
             search_bulk,
             refetch_listing,
+            refetch_many,
+            get_outdated_ids,
+            set_price_override,
             download_images,
             get_settings,
             set_settings,
