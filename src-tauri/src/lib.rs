@@ -199,13 +199,16 @@ pub struct AppState {
 
 fn app_folder() -> PathBuf {
     // Resolve ~/Documents/AliExpress Manager the same way the Python side does,
-    // so Rust and Python always agree. Prefer the XDG documents dir when it's
-    // configured, but fall back to ~/Documents rather than the app's working
-    // directory (dirs::document_dir() returns None on setups without XDG
-    // user-dirs, e.g. minimal/Hyprland, which would otherwise write locally).
+    // so Rust and Python always agree. Prefer the XDG documents dir, then
+    // ~/Documents via home_dir, then $HOME directly. Only as an absolute last
+    // resort (no home discoverable at all) do we fall back to the working dir —
+    // and even then into a clearly-named subfolder, never scattering files into
+    // wherever the app was launched from.
+    let home = dirs::home_dir()
+        .or_else(|| std::env::var_os("HOME").map(PathBuf::from));
     let docs = dirs::document_dir()
-        .or_else(|| dirs::home_dir().map(|h| h.join("Documents")))
-        .unwrap_or_else(|| PathBuf::from("."));
+        .or_else(|| home.as_ref().map(|h| h.join("Documents")))
+        .unwrap_or_else(|| PathBuf::from("./AliExpress-Manager-data"));
     let dir = docs.join("AliExpress Manager");
     let _ = std::fs::create_dir_all(&dir);
     dir
