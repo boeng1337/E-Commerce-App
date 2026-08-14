@@ -818,6 +818,13 @@ async fn check_international(
 
     Ok(InternationalResult { id, countries: results })
 }
+
+/// Searches many URLs/IDs (one per line of `input`), respecting the current
+/// concurrency limit (max simultaneous python processes) and sleep-between-
+/// searches setting from Settings.
+#[tauri::command]
+async fn search_bulk(
+    state: State<'_, AppState>,
     input: String,
 ) -> Result<BulkSearchResult, String> {
     let lines: Vec<String> = input
