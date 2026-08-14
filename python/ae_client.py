@@ -143,13 +143,14 @@ def _extract_product_id(url_or_id):
 
 
 def fetch_product(url_or_id, ship_to_country="FR", target_currency="EUR",
-                  target_language="fr"):
+                  target_language="fr", remove_personal_benefit=False):
     """Fetch one product via the DS API, normalised into the scraper's dict shape.
     Parses the REAL aliexpress.ds.product.get response structure.
 
     ship_to_country / target_currency control which country's availability and
-    pricing the API returns — the same product can ship (or not) and be priced
-    differently per country. Defaults keep the original FR/EUR behaviour."""
+    pricing the API returns. remove_personal_benefit=True strips account-specific
+    ("crowd type") promotions, giving the account-neutral base price — used as
+    the calculation basis. The default (False) returns the promotional price."""
     if not _LIB_OK:
         raise RuntimeError("python-aliexpress-api isn't installed.")
     key, secret = _credentials()
@@ -161,6 +162,7 @@ def fetch_product(url_or_id, ship_to_country="FR", target_currency="EUR",
     req.ship_to_country = ship_to_country
     req.target_currency = target_currency
     req.target_language = target_language
+    req.remove_personal_benefit = bool(remove_personal_benefit)
     token = config.get("ALIEXPRESS_ACCESS_TOKEN")
     resp = req.getResponse(authrize=token)
 
@@ -259,8 +261,11 @@ def fetch_product(url_or_id, ship_to_country="FR", target_currency="EUR",
         sku_list = [sku_list]
 
     warehouse = None  # ship-from location, extracted from SKU properties
+    primary_sku_id = None  # first SKU id, used for freight/deliverability queries
 
     for sku in sku_list:
+        if primary_sku_id is None and sku.get("sku_id"):
+            primary_sku_id = str(sku.get("sku_id"))
         stock = sku.get("sku_available_stock")
         try:
             stock_n = int(stock) if stock is not None else None
@@ -366,6 +371,7 @@ def fetch_product(url_or_id, ship_to_country="FR", target_currency="EUR",
         "sales_count": sales_count,
         "product_status": product_status,
         "ships": ships,
+        "primary_sku_id": primary_sku_id,
         "api_category_id": category_name or category_id_api,
         "brand": brand,
         "_raw": resp,
