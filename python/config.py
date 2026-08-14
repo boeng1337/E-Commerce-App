@@ -9,7 +9,25 @@ care which one it's talking to.
 
 import os
 
-_ENV_PATH = os.path.join(os.path.dirname(__file__), "api_keys.env")
+
+def _app_folder():
+    """The one shared app folder: ~/Documents/AliExpress Manager.
+    Keeps credentials in the same place as the product list and image
+    dossiers written by the Rust side. Falls back to this file's own
+    directory if the Documents folder can't be determined."""
+    home = os.path.expanduser("~")
+    docs = os.path.join(home, "Documents")
+    if os.path.isdir(docs):
+        folder = os.path.join(docs, "AliExpress Manager")
+        try:
+            os.makedirs(folder, exist_ok=True)
+            return folder
+        except OSError:
+            pass
+    return os.path.dirname(__file__)
+
+
+_ENV_PATH = os.path.join(_app_folder(), "api_keys.env")
 
 
 def _read_all():
