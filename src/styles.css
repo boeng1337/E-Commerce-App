@@ -19,25 +19,16 @@ body {
 }
 
 .app {
-  max-width: 960px;
+  max-width: 1100px;
   margin: 0 auto;
   padding: 24px;
-  transition: margin 0.18s ease-out, max-width 0.18s ease-out;
 }
 
-/* When the detail drawer is open, narrow the content and shift it left so the
-   table stays fully visible and usable beside the drawer. */
+/* Keep the content centered and stable when the detail drawer opens; the
+   drawer overlays on the right rather than shoving the table around. */
 .app.with-detail {
-  max-width: calc(100% - 560px);
-  margin-left: 24px;
-  margin-right: 0;
-}
-
-@media (max-width: 900px) {
-  .app.with-detail {
-    max-width: 100%;
-    margin: 0 auto;
-  }
+  max-width: 1100px;
+  margin: 0 auto;
 }
 
 header {
@@ -837,6 +828,7 @@ th {
 .columns-menu {
   position: absolute;
   margin-top: 40px;
+  left: 24px;
   background: var(--surface);
   border: 1px solid var(--border);
   border-radius: 8px;
@@ -845,6 +837,8 @@ th {
   display: grid;
   gap: 4px;
   box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+  max-height: 60vh;
+  overflow-y: auto;
 }
 
 .columns-item {
@@ -995,4 +989,45 @@ tr.intl-noship td {
   color: var(--muted);
   margin: 10px 0 0 0;
   line-height: 1.4;
+}
+
+/* --- Detail catcher: click anywhere outside the drawer to close --- */
+.detail-catcher {
+  position: fixed;
+  inset: 0;
+  z-index: 35; /* below the drawer (40), above everything else */
+  background: transparent;
+}
+
+/* --- Fixed table layout so columns/title don't reflow on every change --- */
+table {
+  table-layout: fixed;
+  width: 100%;
+}
+
+/* Title column: fixed width, truncate long titles to one line */
+.title-link {
+  display: inline-block;
+  max-width: 320px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  vertical-align: middle;
+  text-align: left;
+}
+
+td, th {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* --- Modals: cap height and scroll instead of growing forever --- */
+.modal {
+  max-height: 85vh;
+  overflow-y: auto;
+}
+
+.detail-drawer {
+  max-height: 100vh;
 }

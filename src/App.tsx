@@ -152,7 +152,6 @@ export default function App() {
   const [downloadingImages, setDownloadingImages] = useState(false);
   const [downloadMsg, setDownloadMsg] = useState<string | null>(null);
   const [copiedDebug, setCopiedDebug] = useState(false);
-  const [refetching, setRefetching] = useState(false);
 
   // price editing in detail view
   const [editingPrice, setEditingPrice] = useState(false);
@@ -330,20 +329,6 @@ export default function App() {
     }
   }
 
-  async function handleRefetch() {
-    if (!detailListing) return;
-    setRefetching(true);
-    setDownloadMsg(null);
-    try {
-      await invoke<Listing>("refetch_listing", { id: detailListing.id });
-      await refresh();
-    } catch (e) {
-      setDownloadMsg(String(e));
-    } finally {
-      setRefetching(false);
-    }
-  }
-
   async function handleDownloadImages() {
     if (!detailListing) return;
     setDownloadingImages(true);
@@ -386,21 +371,6 @@ export default function App() {
       setStatusMsg(null);
     } finally {
       setBusy(false);
-    }
-  }
-
-  async function handleDelete(id: string) {
-    try {
-      await invoke("delete_listing", { id });
-      setSelected((prev) => {
-        const next = new Set(prev);
-        next.delete(id);
-        return next;
-      });
-      if (detailId === id) setDetailId(null);
-      await refresh();
-    } catch (e) {
-      setError(String(e));
     }
   }
 
@@ -638,7 +608,6 @@ export default function App() {
   return (
     <div
       className={`app ${detailListing ? "with-detail" : ""}`}
-      onClick={() => { if (detailListing) closeDetail(); }}
     >
       <header>
         <h1>Sourced Listings</h1>
@@ -722,7 +691,6 @@ export default function App() {
             {isColVisible("sales") && <th className="sortable" onClick={() => sortBy("sales")}>Sales{sortArrow("sales")}</th>}
             {isColVisible("brand") && <th className="sortable" onClick={() => sortBy("brand")}>Brand{sortArrow("brand")}</th>}
             {isColVisible("last_fetched") && <th className="sortable" onClick={() => sortBy("last_fetched")}>Last fetched{sortArrow("last_fetched")}</th>}
-            <th className="col-actions"></th>
           </tr>
         </thead>
         <tbody>
@@ -772,11 +740,6 @@ export default function App() {
                 {isColVisible("sales") && <td>{l.sales_count ?? "—"}</td>}
                 {isColVisible("brand") && <td>{l.brand ?? "—"}</td>}
                 {isColVisible("last_fetched") && <td className="col-date">{formatDate(l.last_fetched)}</td>}
-                <td className="col-actions">
-                  <button className="delete-btn" onClick={() => handleDelete(l.id)}>
-                    ✕
-                  </button>
-                </td>
               </tr>
               {expandedId === l.id &&
                 l.variants.map((v, i) => (
@@ -990,6 +953,11 @@ export default function App() {
         </div>
       )}
 
+      {/* Full-viewport catcher: clicking anywhere outside the drawer closes it */}
+      {detailListing && (
+        <div className="detail-catcher" onClick={closeDetail} />
+      )}
+
       {/* Detail drawer — no backdrop, so the table stays usable beside it.
           Closes on Escape, or by clicking a row / empty table area. */}
       {detailListing && (
@@ -1038,15 +1006,6 @@ export default function App() {
               <h2>{detailListing.title}</h2>
             )}
             <div className="detail-actions">
-              {detailListing.source_url && (
-                <button
-                  className="secondary-btn download-btn"
-                  onClick={handleRefetch}
-                  disabled={refetching}
-                >
-                  {refetching ? "Refetching…" : "Refetch data"}
-                </button>
-              )}
               {detailListing.images.length > 0 && (
                 <button
                   className="secondary-btn download-btn"
