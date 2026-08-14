@@ -142,9 +142,14 @@ def _extract_product_id(url_or_id):
     return m.group(1) if m else s
 
 
-def fetch_product(url_or_id):
+def fetch_product(url_or_id, ship_to_country="FR", target_currency="EUR",
+                  target_language="fr"):
     """Fetch one product via the DS API, normalised into the scraper's dict shape.
-    Parses the REAL aliexpress.ds.product.get response structure."""
+    Parses the REAL aliexpress.ds.product.get response structure.
+
+    ship_to_country / target_currency control which country's availability and
+    pricing the API returns — the same product can ship (or not) and be priced
+    differently per country. Defaults keep the original FR/EUR behaviour."""
     if not _LIB_OK:
         raise RuntimeError("python-aliexpress-api isn't installed.")
     key, secret = _credentials()
@@ -153,9 +158,9 @@ def fetch_product(url_or_id):
     req = _DsProductGetRequest()
     req.set_app_info(_AppInfo(key, secret))
     req.product_id = pid
-    req.ship_to_country = "FR"
-    req.target_currency = "EUR"
-    req.target_language = "fr"
+    req.ship_to_country = ship_to_country
+    req.target_currency = target_currency
+    req.target_language = target_language
     token = config.get("ALIEXPRESS_ACCESS_TOKEN")
     resp = req.getResponse(authrize=token)
 
@@ -177,6 +182,25 @@ def fetch_product(url_or_id):
     store = result.get("ae_store_info", {}) or {}
     store_name = store.get("store_name")
     store_country = store.get("store_country_code")
+
+    # store ratings (present for some stores, absent for others)
+    def _f(v):
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return None
+    store_ratings = [
+        _f(store.get("communication_rating")),
+        _f(store.get("item_as_described_rating")),
+        _f(store.get("shipping_speed_rating")),
+    ]
+    store_ratings = [r for r in store_ratings if r is not None]
+    store_rating = round(sum(store_ratings) / len(store_ratings), 1) if store_ratings else None
+
+    # product rating, sales count, status
+    product_rating = _f(base.get("avg_evaluation_rating"))
+    sales_count = base.get("sales_count")  # e.g. "600+" or "71" — keep as string
+    product_status = base.get("product_status_type")
 
     # brand — often in the property list; useful for auto-tagging
     brand = None
@@ -314,6 +338,13 @@ def fetch_product(url_or_id):
         if ship_from:
             warehouse = str(ship_from)
 
+    # "ships to the queried country": the API returned sellable SKUs with stock.
+    # An empty SKU list or zero total stock for a country generally means the
+    # product isn't available/shippable there.
+    ships = bool(variant_prices) and (total_stock is None or total_stock > 0)
+    if product_status and str(product_status).lower() != "onselling":
+        ships = False
+
     parsed = {
         "name": name,
         "prices": prices,
@@ -325,6 +356,12 @@ def fetch_product(url_or_id):
         "source": "api",
         "clean_url": clean_url,
         "store_name": store_name,
+        "store_country": store_country,
+        "store_rating": store_rating,
+        "product_rating": product_rating,
+        "sales_count": sales_count,
+        "product_status": product_status,
+        "ships": ships,
         "api_category_id": category_id_api,
         "brand": brand,
         "_raw": resp,
