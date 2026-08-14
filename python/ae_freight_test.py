@@ -1,32 +1,32 @@
 """
-ae_freight_test.py — one-off probe: does the DS freight/shipping endpoint
-return real per-country deliverability that aliexpress.ds.product.get does NOT?
+ae_freight_test.py — probe the AE-Freight (Shipment) endpoint, which returns
+REAL per-country deliverability that aliexpress.ds.product.get does NOT.
 
-We proved product.get echoes ship_to_country but reports the same availability
-regardless of destination (FR and ES both showed stock 52 / onSelling for a
-product that can't actually ship to ES). The freight endpoint is purpose-built
-to answer "can this reach country X, and at what shipping cost", so it MIGHT
-carry the honest answer — if this DS app has permission to call it.
+Confirmed from the API docs: the freight query takes a `queryDeliveryReq`
+object and, when a product can't ship to the requested country, returns the
+error DELIVERY_NOT_AVAILABLE_TO_YOUR_ADDRESS instead of delivery_options.
 
 Usage:
-    python3 ae_freight_test.py [product_id]
+    python3 ae_freight_test.py [product_id] [sku_id]
 
-Defaults to the Anker product we've been testing. Prints the raw response for
-FR and for ES so they can be compared. If it errors with a permission/auth
-message, this DS app can't call freight and country-level deliverability is
-genuinely out of reach through this access.
+IMPORTANT: run this with the SAME Python that has python-aliexpress-api
+installed — i.e. the app's venv, not the system python3. If you see
+"python-aliexpress-api isn't installed", you're on the wrong interpreter; use
+the venv (see the message this script prints for the path hint).
 """
 
 import sys
 import json
+import os
 
 import config
 
 try:
     from aliexpress_api.skd.api.base import RestApi
     _LIB_OK = True
-except Exception:
+except Exception as _imp_err:
     _LIB_OK = False
+    _IMPORT_ERROR = _imp_err
 
 
 class _AppInfo:
@@ -43,44 +43,74 @@ def _credentials():
     return key, secret
 
 
-# The DS freight query. Method name follows AliExpress's DS family naming; if
-# this exact method isn't granted, the API returns an error we can read.
-class _DsFreightRequest(RestApi):
-    def __init__(self, method, domain="api-sg.aliexpress.com", port=80):
-        RestApi.__init__(self, domain, port)
-        self._method = method
-        # common freight params across DS freight variants
-        self.queryDeliveryReq = None      # some variants take a JSON blob
-        self.product_id = None
-        self.ship_to_country = None
-        self.currency = None
-        self.language = None
-        self.product_num = 1
-        self.send_goods_country_code = None
-        self.price = None
-        self.sku_id = None
+# Request classes are only defined when the library imported, so a missing
+# library fails with a clear message instead of a NameError at load time.
+if _LIB_OK:
+    class _FreightRequest(RestApi):
+        """AE-Freight query — single queryDeliveryReq object."""
+        def __init__(self, method, domain="api-sg.aliexpress.com", port=80):
+            RestApi.__init__(self, domain, port)
+            self._method = method
+            self.queryDeliveryReq = None
 
-    def getapiname(self):
-        return self._method
+        def getapiname(self):
+            return self._method
+
+    class _DsProductGetRequest(RestApi):
+        def __init__(self, domain="api-sg.aliexpress.com", port=80):
+            RestApi.__init__(self, domain, port)
+            self.product_id = None
+            self.ship_to_country = None
+            self.target_currency = None
+            self.target_language = None
+
+        def getapiname(self):
+            return "aliexpress.ds.product.get"
 
 
-def probe(method, product_id, country, token, key, secret):
-    """Try one freight method for one country. Returns (ok, response_or_error)."""
+def _first_sku_id(product_id, token, key, secret):
     try:
-        req = _DsFreightRequest(method)
+        req = _DsProductGetRequest()
         req.set_app_info(_AppInfo(key, secret))
         req.product_id = product_id
-        req.ship_to_country = country
-        req.currency = "EUR"
-        req.language = "en"
-        req.product_num = 1
-        # Some freight endpoints want a JSON query object instead of flat params
+        req.ship_to_country = "FR"
+        req.target_currency = "EUR"
+        req.target_language = "en"
+        resp = req.getResponse(authrize=token)
+
+        def deep_find(d, wanted):
+            if isinstance(d, dict):
+                for k, v in d.items():
+                    if k == wanted:
+                        return v
+                    r = deep_find(v, wanted)
+                    if r is not None:
+                        return r
+            elif isinstance(d, list):
+                for it in d:
+                    r = deep_find(it, wanted)
+                    if r is not None:
+                        return r
+            return None
+
+        return deep_find(resp, "sku_id")
+    except Exception as e:
+        print(f"(couldn't auto-fetch sku_id: {e})")
+        return None
+
+
+def probe(method, product_id, sku_id, country, currency, token, key, secret):
+    try:
+        req = _FreightRequest(method)
+        req.set_app_info(_AppInfo(key, secret))
         req.queryDeliveryReq = json.dumps({
-            "productId": product_id,
             "quantity": 1,
             "shipToCountry": country,
+            "productId": str(product_id),
             "language": "en",
-            "currency": "EUR",
+            "locale": "en_US",
+            "selectedSkuId": str(sku_id) if sku_id else "",
+            "currency": currency,
         })
         resp = req.getResponse(authrize=token)
         return True, resp
@@ -90,30 +120,39 @@ def probe(method, product_id, country, token, key, secret):
 
 def main():
     if not _LIB_OK:
-        print("python-aliexpress-api isn't installed.")
+        print("python-aliexpress-api isn't installed for THIS python interpreter.")
+        print(f"  import error: {_IMPORT_ERROR}")
+        print(f"  interpreter:  {sys.executable}")
+        print("")
+        print("Run it with the app's venv instead, e.g.:")
+        print("  ~/.local/share/aliexpress-manager/venv/bin/python3 ae_freight_test.py")
+        print("(adjust the venv path if your .run script puts it elsewhere)")
         sys.exit(1)
 
     product_id = sys.argv[1] if len(sys.argv) > 1 else "1005008564267252"
+    sku_id = sys.argv[2] if len(sys.argv) > 2 else None
+
     token = config.get("ALIEXPRESS_ACCESS_TOKEN")
     if not token:
         print("No access token — authorize in the app first.")
         sys.exit(1)
     key, secret = _credentials()
 
-    # Candidate method names to try, most-likely first. AliExpress has renamed
-    # freight endpoints over time; we try the known DS variants and report which
-    # (if any) the app is allowed to call.
+    if not sku_id:
+        sku_id = _first_sku_id(product_id, token, key, secret)
+        print(f"Using sku_id: {sku_id}")
+
     methods = [
         "aliexpress.ds.freight.query",
         "aliexpress.logistics.buyer.freight.calculate",
-        "aliexpress.ds.recommend.feed.get",  # sanity: known DS method shape
+        "aliexpress.ds.recommend.feed.get",
     ]
 
     for method in methods:
         print("=" * 70)
         print(f"METHOD: {method}")
-        for country in ("FR", "ES"):
-            ok, result = probe(method, product_id, country, token, key, secret)
+        for country, currency in (("FR", "EUR"), ("ES", "EUR")):
+            ok, result = probe(method, product_id, sku_id, country, currency, token, key, secret)
             print(f"\n--- {country} ---")
             if ok:
                 print(json.dumps(result, ensure_ascii=False, indent=2)[:4000])
