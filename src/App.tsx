@@ -21,6 +21,7 @@ type Listing = {
   source_url: string | null;
   store_name: string | null;
   brand: string | null;
+  debug_json: string | null;
 };
 
 type Settings = {
@@ -52,8 +53,6 @@ export default function App() {
   const [statusMsg, setStatusMsg] = useState<string | null>(null);
 
   const [searchInput, setSearchInput] = useState("");
-  const [bulkMode, setBulkMode] = useState(false);
-  const [bulkInput, setBulkInput] = useState("");
 
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [settings, setSettingsState] = useState<Settings>({
@@ -64,6 +63,8 @@ export default function App() {
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const [detailListing, setDetailListing] = useState<Listing | null>(null);
+  const [downloadingImages, setDownloadingImages] = useState(false);
+  const [downloadMsg, setDownloadMsg] = useState<string | null>(null);
 
   const [authStatus, setAuthStatus] = useState<AuthStatus | null>(null);
   const [redirectUri, setRedirectUri] = useState("");
@@ -183,14 +184,48 @@ export default function App() {
     }
   }
 
-  async function runBulkSearch() {
-    const value = bulkInput.trim();
-    if (!value) return;
+  function downloadDebugJson() {
+    if (!detailListing?.debug_json) return;
+    const blob = new Blob([detailListing.debug_json], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `${detailListing.id}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  async function handleDownloadImages() {
+    if (!detailListing) return;
+    setDownloadingImages(true);
+    setDownloadMsg(null);
+    try {
+      const result = await invoke<{ folder: string; saved: number; errors: string[] }>(
+        "download_images",
+        { id: detailListing.id }
+      );
+      setDownloadMsg(
+        `Saved ${result.saved} image${result.saved === 1 ? "" : "s"} to ${result.folder}` +
+          (result.errors.length > 0 ? ` (${result.errors.length} failed)` : "")
+      );
+    } catch (e) {
+      setDownloadMsg(String(e));
+    } finally {
+      setDownloadingImages(false);
+    }
+  }
+
+  async function handleSearchDrop(e: React.DragEvent) {
+    e.preventDefault();
+    const file = e.dataTransfer.files[0];
+    if (!file) return;
+    const text = await file.text();
+    if (!text.trim()) return;
     setLoading(true);
     setError(null);
     setStatusMsg(null);
     try {
-      const result = await invoke<BulkSearchResult>("search_bulk", { input: value });
+      const result = await invoke<BulkSearchResult>("search_bulk", { input: text });
       setStatusMsg(
         `Added ${result.added} listing${result.added === 1 ? "" : "s"}` +
           (result.errors.length > 0 ? `, ${result.errors.length} failed` : "")
@@ -198,10 +233,9 @@ export default function App() {
       if (result.errors.length > 0) {
         setError(result.errors.join("\n"));
       }
-      setBulkInput("");
       await refresh();
-    } catch (e) {
-      setError(String(e));
+    } catch (err) {
+      setError(String(err));
     } finally {
       setLoading(false);
     }
@@ -253,40 +287,21 @@ export default function App() {
       </header>
 
       <div className="search-bar">
-        <div className="search-row">
+        <div
+          className="search-row"
+          onDrop={handleSearchDrop}
+          onDragOver={(e) => e.preventDefault()}
+        >
           <input
             type="text"
-            placeholder="Paste an AliExpress link or product ID…"
+            placeholder="Link or ID — press Enter, or drop a .txt file to search many…"
             value={searchInput}
             onChange={(e) => setSearchInput(e.target.value)}
             onKeyDown={(e) => e.key === "Enter" && runSingleSearch()}
-            disabled={loading || bulkMode}
+            disabled={loading}
           />
-          <button onClick={runSingleSearch} disabled={loading || bulkMode || !searchInput.trim()}>
-            {loading && !bulkMode ? "Searching…" : "Search"}
-          </button>
-          <button
-            className={`toggle-btn ${bulkMode ? "active" : ""}`}
-            onClick={() => setBulkMode((v) => !v)}
-          >
-            Bulk
-          </button>
+          {loading && <span className="search-spinner">Searching…</span>}
         </div>
-
-        {bulkMode && (
-          <div className="bulk-row">
-            <textarea
-              placeholder="Paste multiple links or IDs, one per line…"
-              value={bulkInput}
-              onChange={(e) => setBulkInput(e.target.value)}
-              rows={4}
-              disabled={loading}
-            />
-            <button onClick={runBulkSearch} disabled={loading || !bulkInput.trim()}>
-              {loading ? "Searching…" : "Search all"}
-            </button>
-          </div>
-        )}
       </div>
 
       {statusMsg && <div className="status">{statusMsg}</div>}
@@ -496,9 +511,9 @@ export default function App() {
       )}
 
       {detailListing && (
-        <div className="modal-backdrop" onClick={() => setDetailListing(null)}>
-          <div className="detail-panel" onClick={(e) => e.stopPropagation()}>
-            <button className="close-x" onClick={() => setDetailListing(null)}>
+        <div className="detail-backdrop" onClick={() => { setDetailListing(null); setDownloadMsg(null); }}>
+          <div className="detail-drawer" onClick={(e) => e.stopPropagation()}>
+            <button className="close-x" onClick={() => { setDetailListing(null); setDownloadMsg(null); }}>
               ✕
             </button>
             <div className="detail-images">
@@ -512,6 +527,20 @@ export default function App() {
             </div>
             <div className="detail-body">
               <h2>{detailListing.title}</h2>
+              {detailListing.images.length > 0 && (
+                <div className="detail-download">
+                  <button
+                    className="secondary-btn download-btn"
+                    onClick={handleDownloadImages}
+                    disabled={downloadingImages}
+                  >
+                    {downloadingImages
+                      ? "Downloading…"
+                      : `Download ${detailListing.images.length} image${detailListing.images.length === 1 ? "" : "s"}`}
+                  </button>
+                  {downloadMsg && <div className="download-msg">{downloadMsg}</div>}
+                </div>
+              )}
               <div className="detail-meta">
                 {detailListing.store_name && <div>Store: {detailListing.store_name}</div>}
                 {detailListing.brand && <div>Brand: {detailListing.brand}</div>}
@@ -555,6 +584,18 @@ export default function App() {
                       ))}
                     </tbody>
                   </table>
+                </div>
+              )}
+
+              {detailListing.debug_json && (
+                <div className="detail-debug">
+                  <div className="detail-debug-head">
+                    <h3>Debug JSON</h3>
+                    <button className="secondary-btn download-btn" onClick={downloadDebugJson}>
+                      Download
+                    </button>
+                  </div>
+                  <pre className="debug-json">{detailListing.debug_json}</pre>
                 </div>
               )}
             </div>

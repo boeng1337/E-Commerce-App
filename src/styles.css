@@ -355,15 +355,84 @@ th {
 }
 
 /* --- Detail panel --- */
-.detail-panel {
+.detail-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.6);
+  z-index: 50;
+}
+
+.detail-drawer {
+  position: fixed;
+  top: 0;
+  right: 0;
+  height: 100vh;
+  width: min(520px, 92vw);
   background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: 10px;
-  width: min(720px, 90vw);
-  max-height: 85vh;
-  overflow-y: auto;
+  border-left: 1px solid var(--border);
   padding: 24px;
-  position: relative;
+  overflow-y: auto;
+  animation: slide-in 0.18s ease-out;
+}
+
+@keyframes slide-in {
+  from { transform: translateX(100%); }
+  to   { transform: translateX(0); }
+}
+
+.detail-debug {
+  margin-top: 20px;
+  border-top: 1px solid var(--border);
+  padding-top: 16px;
+}
+
+.detail-download {
+  margin-bottom: 16px;
+}
+
+.download-msg {
+  margin-top: 8px;
+  font-size: 12px;
+  color: var(--muted);
+  word-break: break-all;
+}
+
+.detail-debug-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 8px;
+}
+
+.detail-debug-head h3 {
+  margin: 0;
+  font-size: 14px;
+}
+
+.download-btn {
+  width: auto;
+  margin: 0;
+  padding: 6px 12px;
+}
+
+.debug-json {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 12px;
+  font-size: 11px;
+  line-height: 1.5;
+  max-height: 320px;
+  overflow: auto;
+  white-space: pre;
+  color: var(--muted);
+}
+
+.search-spinner {
+  align-self: center;
+  color: var(--muted);
+  font-size: 13px;
+  white-space: nowrap;
 }
 
 .close-x {
