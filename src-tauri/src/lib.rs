@@ -39,12 +39,24 @@ pub struct Listing {
     pub last_fetched: Option<i64>, // Unix seconds
     #[serde(default)]
     pub price_override: Option<f64>, // manual edit, protected from refetch
+    #[serde(default)]
+    pub store_country: Option<String>,
+    #[serde(default)]
+    pub store_rating: Option<f64>,
+    #[serde(default)]
+    pub product_rating: Option<f64>,
+    #[serde(default)]
+    pub sales_count: Option<String>,
+    #[serde(default)]
+    pub product_status: Option<String>,
+    #[serde(default)]
+    pub ships: Option<bool>,
 }
 
 /// Bump this whenever a fetch starts capturing new data. Listings stamped with
 /// a lower version (or none) are considered "outdated" and can be refetched to
 /// bring them up to the current shape.
-pub const CURRENT_DATA_VERSION: i64 = 2;
+pub const CURRENT_DATA_VERSION: i64 = 3;
 
 fn now_unix() -> i64 {
     std::time::SystemTime::now()
@@ -57,6 +69,39 @@ fn now_unix() -> i64 {
 pub struct Settings {
     pub concurrency: usize, // 1-3
     pub sleep_seconds: f64, // 1-5
+    #[serde(default = "default_home_country")]
+    pub home_country: String, // e.g. "FR"
+    #[serde(default = "default_home_currency")]
+    pub home_currency: String, // e.g. "EUR"
+    #[serde(default)]
+    pub international_enabled: bool,
+    #[serde(default = "default_check_countries")]
+    pub check_countries: Vec<String>, // ISO codes to check for international view
+    #[serde(default)]
+    pub hidden_columns: Vec<String>, // column keys the user has hidden
+    #[serde(default)]
+    pub sort_key: Option<String>,
+    #[serde(default)]
+    pub sort_dir: Option<String>, // "asc" | "desc"
+}
+
+fn default_home_country() -> String {
+    "FR".to_string()
+}
+fn default_home_currency() -> String {
+    "EUR".to_string()
+}
+fn default_check_countries() -> Vec<String> {
+    // EU market by default (mirrors AliExpress ship-to destinations; real
+    // markets only, no micro-states).
+    vec![
+        "FR", "DE", "ES", "IT", "NL", "BE", "PL", "PT", "SE", "AT", "IE", "DK",
+        "FI", "GR", "CZ", "RO", "HU", "SK", "BG", "HR", "LT", "LV", "EE", "SI",
+        "LU",
+    ]
+    .into_iter()
+    .map(|s| s.to_string())
+    .collect()
 }
 
 impl Default for Settings {
@@ -64,6 +109,13 @@ impl Default for Settings {
         Settings {
             concurrency: 1,
             sleep_seconds: 2.0,
+            home_country: default_home_country(),
+            home_currency: default_home_currency(),
+            international_enabled: false,
+            check_countries: default_check_countries(),
+            hidden_columns: vec![],
+            sort_key: None,
+            sort_dir: None,
         }
     }
 }
@@ -72,8 +124,52 @@ impl Settings {
     fn clamp(mut self) -> Self {
         self.concurrency = self.concurrency.clamp(1, 3);
         self.sleep_seconds = self.sleep_seconds.clamp(1.0, 5.0);
+        if self.home_country.trim().is_empty() {
+            self.home_country = default_home_country();
+        }
+        if self.home_currency.trim().is_empty() {
+            self.home_currency = default_home_currency();
+        }
         self
     }
+}
+
+/// Currency to use for a given country when querying its price. EU countries
+/// use EUR; a few common non-euro ones are mapped. Falls back to the home
+/// currency for anything unmapped.
+fn currency_for_country(country: &str, home_currency: &str) -> String {
+    match country {
+        "PL" => "PLN",
+        "SE" => "SEK",
+        "DK" => "DKK",
+        "CZ" => "CZK",
+        "RO" => "RON",
+        "HU" => "HUF",
+        "BG" => "BGN",
+        "HR" => "EUR", // Croatia adopted EUR in 2023
+        "FR" | "DE" | "ES" | "IT" | "NL" | "BE" | "PT" | "AT" | "IE" | "FI"
+        | "GR" | "SK" | "LT" | "LV" | "EE" | "SI" | "LU" => "EUR",
+        _ => home_currency,
+    }
+    .to_string()
+}
+
+/// Per-country result of an international availability/price check.
+#[derive(Debug, Clone, Serialize)]
+pub struct CountryResult {
+    pub country: String,
+    pub ships: bool,
+    pub price_min: Option<f64>,
+    pub price_max: Option<f64>,
+    pub currency: String,
+    pub variants: Vec<Variant>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct InternationalResult {
+    pub id: String,
+    pub countries: Vec<CountryResult>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -102,7 +198,14 @@ pub struct AppState {
 // ---------------------------------------------------------------------------
 
 fn app_folder() -> PathBuf {
-    let docs = dirs::document_dir().unwrap_or_else(|| PathBuf::from("."));
+    // Resolve ~/Documents/AliExpress Manager the same way the Python side does,
+    // so Rust and Python always agree. Prefer the XDG documents dir when it's
+    // configured, but fall back to ~/Documents rather than the app's working
+    // directory (dirs::document_dir() returns None on setups without XDG
+    // user-dirs, e.g. minimal/Hyprland, which would otherwise write locally).
+    let docs = dirs::document_dir()
+        .or_else(|| dirs::home_dir().map(|h| h.join("Documents")))
+        .unwrap_or_else(|| PathBuf::from("."));
     let dir = docs.join("AliExpress Manager");
     let _ = std::fs::create_dir_all(&dir);
     dir
@@ -223,6 +326,12 @@ fn add_manual_listing(state: State<AppState>, title: String, price: f64, stock: 
         data_version: Some(CURRENT_DATA_VERSION),
         last_fetched: Some(now_unix()),
         price_override: None,
+        store_country: None,
+        store_rating: None,
+        product_rating: None,
+        sales_count: None,
+        product_status: None,
+        ships: None,
     };
     state.listings.lock().unwrap().push(listing.clone());
     persist_listings(&state);
@@ -279,12 +388,15 @@ fn python_bin() -> String {
     std::env::var("AE_PYTHON_BIN").unwrap_or_else(|_| "python3".to_string())
 }
 
-/// Runs ae_cli.py <input> and parses its JSON stdout into a Listing.
-async fn fetch_one(input: &str) -> Result<Listing, String> {
+/// Runs ae_cli.py <input> [country] [currency] and parses its JSON stdout.
+/// Returns the raw parsed JSON value (not yet a Listing).
+async fn fetch_raw(input: &str, country: &str, currency: &str) -> Result<serde_json::Value, String> {
     let script = resolve_script_path();
     let output = TokioCommand::new(python_bin())
         .arg(&script)
         .arg(input)
+        .arg(country)
+        .arg(currency)
         .output()
         .await
         .map_err(|e| format!("failed to run python ({}): {e}", script.display()))?;
@@ -304,8 +416,18 @@ async fn fetch_one(input: &str) -> Result<Listing, String> {
     if let Some(err) = json.get("error") {
         return Err(err.as_str().unwrap_or("unknown python error").to_string());
     }
+    Ok(json)
+}
 
+/// Fetches and builds a full Listing for the given country/currency.
+async fn fetch_one_in(input: &str, country: &str, currency: &str) -> Result<Listing, String> {
+    let json = fetch_raw(input, country, currency).await?;
     parse_product_json(&json, input)
+}
+
+/// Fetches a Listing using the app's configured home market (country/currency).
+async fn fetch_one(input: &str, home_country: &str, home_currency: &str) -> Result<Listing, String> {
+    fetch_one_in(input, home_country, home_currency).await
 }
 
 fn parse_product_json(json: &serde_json::Value, source_input: &str) -> Result<Listing, String> {
@@ -397,6 +519,22 @@ fn parse_product_json(json: &serde_json::Value, source_input: &str) -> Result<Li
         }
     });
 
+    let store_country = json
+        .get("store_country")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let store_rating = json.get("store_rating").and_then(|v| v.as_f64());
+    let product_rating = json.get("product_rating").and_then(|v| v.as_f64());
+    let sales_count = json
+        .get("sales_count")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let product_status = json
+        .get("product_status")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let ships = json.get("ships").and_then(|v| v.as_bool());
+
     Ok(Listing {
         id: Uuid::new_v4().to_string(),
         title: name,
@@ -416,13 +554,23 @@ fn parse_product_json(json: &serde_json::Value, source_input: &str) -> Result<Li
         data_version: Some(CURRENT_DATA_VERSION),
         last_fetched: Some(now_unix()),
         price_override: None,
+        store_country,
+        store_rating,
+        product_rating,
+        sales_count,
+        product_status,
+        ships,
     })
 }
 
 /// Searches a single URL/product ID.
 #[tauri::command]
 async fn search_one(state: State<'_, AppState>, input: String) -> Result<Listing, String> {
-    let listing = fetch_one(input.trim()).await?;
+    let (hc, hcur) = {
+        let s = state.settings.lock().unwrap();
+        (s.home_country.clone(), s.home_currency.clone())
+    };
+    let listing = fetch_one(input.trim(), &hc, &hcur).await?;
     state.listings.lock().unwrap().push(listing.clone());
     persist_listings(&state);
     Ok(listing)
@@ -451,8 +599,12 @@ async fn refetch_listing(
             .ok_or_else(|| "this listing has no source URL to refetch".to_string())?;
         (src, existing.price_override)
     };
+    let (hc, hcur) = {
+        let s = state.settings.lock().unwrap();
+        (s.home_country.clone(), s.home_currency.clone())
+    };
 
-    let mut fresh = fetch_one(source.trim()).await?;
+    let mut fresh = fetch_one(source.trim(), &hc, &hcur).await?;
     fresh.id = id.clone();
     // keep the manual price override unless the caller explicitly releases it
     if release_override != Some(true) {
@@ -525,7 +677,10 @@ async fn refetch_many(
 ) -> Result<BulkSearchResult, String> {
     let release: std::collections::HashSet<String> =
         release_ids.unwrap_or_default().into_iter().collect();
-    let sleep_secs = state.settings.lock().unwrap().sleep_seconds;
+    let (sleep_secs, hc, hcur) = {
+        let s = state.settings.lock().unwrap();
+        (s.sleep_seconds, s.home_country.clone(), s.home_currency.clone())
+    };
 
     let mut updated = 0usize;
     let mut errors = Vec::new();
@@ -548,7 +703,7 @@ async fn refetch_many(
             }
         };
 
-        match fetch_one(source.trim()).await {
+        match fetch_one(source.trim(), &hc, &hcur).await {
             Ok(mut fresh) => {
                 fresh.id = id.clone();
                 if !release.contains(&id) {
@@ -572,12 +727,97 @@ async fn refetch_many(
     })
 }
 
-/// Searches many URLs/IDs (one per line of `input`), respecting the current
-/// concurrency limit (max simultaneous python processes) and sleep-between-
-/// searches setting from Settings.
+/// Checks a product's availability and price across the configured countries.
+/// For each enabled country it fetches the product with that ship-to country
+/// (and appropriate currency) and records whether it ships, the price range,
+/// and the per-country variants. Runs sequentially, respecting the sleep
+/// setting, since it can be many calls.
 #[tauri::command]
-async fn search_bulk(
+async fn check_international(
     state: State<'_, AppState>,
+    id: String,
+) -> Result<InternationalResult, String> {
+    let source = {
+        let listings = state.listings.lock().unwrap();
+        let existing = listings
+            .iter()
+            .find(|l| l.id == id)
+            .ok_or_else(|| "listing not found".to_string())?;
+        existing
+            .source_url
+            .clone()
+            .ok_or_else(|| "this listing has no source URL".to_string())?
+    };
+    let (countries, sleep_secs, home_currency) = {
+        let s = state.settings.lock().unwrap();
+        if !s.international_enabled {
+            return Err("international check is disabled in settings".to_string());
+        }
+        (
+            s.check_countries.clone(),
+            s.sleep_seconds,
+            s.home_currency.clone(),
+        )
+    };
+
+    let mut results = Vec::with_capacity(countries.len());
+    for country in countries {
+        let currency = currency_for_country(&country, &home_currency);
+        match fetch_raw(source.trim(), &country, &currency).await {
+            Ok(json) => {
+                let ships = json.get("ships").and_then(|v| v.as_bool()).unwrap_or(false);
+                let prices: Vec<f64> = json
+                    .get("prices")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| arr.iter().filter_map(|v| v.as_f64()).collect())
+                    .unwrap_or_default();
+                let price_min = prices.iter().cloned().fold(None, |acc: Option<f64>, p| {
+                    Some(acc.map_or(p, |a| a.min(p)))
+                });
+                let price_max = prices.iter().cloned().fold(None, |acc: Option<f64>, p| {
+                    Some(acc.map_or(p, |a| a.max(p)))
+                });
+                let variants: Vec<Variant> = json
+                    .get("variant_prices")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| {
+                                let label = v.get("variant")?.as_str()?.to_string();
+                                let price = v.get("price").and_then(|p| p.as_f64());
+                                let in_stock = v.get("in_stock").and_then(|p| p.as_bool());
+                                Some(Variant { label, price, in_stock })
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                results.push(CountryResult {
+                    country,
+                    ships,
+                    price_min,
+                    price_max,
+                    currency,
+                    variants,
+                    error: None,
+                });
+            }
+            Err(e) => {
+                results.push(CountryResult {
+                    country,
+                    ships: false,
+                    price_min: None,
+                    price_max: None,
+                    currency,
+                    variants: vec![],
+                    error: Some(e),
+                });
+            }
+        }
+        sleep(Duration::from_secs_f64(sleep_secs)).await;
+    }
+
+    Ok(InternationalResult { id, countries: results })
+}
     input: String,
 ) -> Result<BulkSearchResult, String> {
     let lines: Vec<String> = input
@@ -596,13 +836,17 @@ async fn search_bulk(
     let settings = state.settings.lock().unwrap().clone();
     let semaphore = Arc::new(Semaphore::new(settings.concurrency));
     let sleep_secs = settings.sleep_seconds;
+    let hc = settings.home_country.clone();
+    let hcur = settings.home_currency.clone();
 
     let mut handles = Vec::with_capacity(lines.len());
     for line in lines {
         let sem = semaphore.clone();
+        let hc = hc.clone();
+        let hcur = hcur.clone();
         handles.push(tokio::spawn(async move {
             let _permit = sem.acquire_owned().await.expect("semaphore closed");
-            let result = fetch_one(&line).await;
+            let result = fetch_one(&line, &hc, &hcur).await;
             sleep(Duration::from_secs_f64(sleep_secs)).await;
             (line, result)
         }));
@@ -770,6 +1014,13 @@ async fn open_auth_page() -> Result<String, String> {
     Ok(url)
 }
 
+/// Opens an arbitrary URL in the system browser (used by the detail-view title
+/// link, so it lands in a real browser rather than the app webview).
+#[tauri::command]
+fn open_url(url: String) -> Result<(), String> {
+    open_in_browser(&url)
+}
+
 fn open_in_browser(url: &str) -> Result<(), String> {
     #[cfg(target_os = "linux")]
     let result = std::process::Command::new("xdg-open").arg(url).spawn();
@@ -856,6 +1107,7 @@ pub fn run() {
             search_bulk,
             refetch_listing,
             refetch_many,
+            check_international,
             get_outdated_ids,
             set_price_override,
             download_images,
@@ -864,6 +1116,7 @@ pub fn run() {
             get_auth_status,
             set_redirect_uri,
             open_auth_page,
+            open_url,
             exchange_auth_code,
             set_ae_credentials,
             has_ae_credentials
