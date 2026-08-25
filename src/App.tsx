@@ -182,6 +182,7 @@ export default function App() {
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const [countryExpandedId, setCountryExpandedId] = useState<string | null>(null);
+  const [showAllVariants, setShowAllVariants] = useState(false);
   const [detailId, setDetailId] = useState<string | null>(null);
   const [downloadingImages, setDownloadingImages] = useState(false);
   const [downloadMsg, setDownloadMsg] = useState<string | null>(null);
@@ -634,40 +635,6 @@ export default function App() {
           />
           {busy && <span className="search-spinner">Working…</span>}
         </div>
-        <div className="intl-bar">
-          <label className="intl-toggle">
-            <input
-              type="checkbox"
-              checked={settings.international_enabled}
-              onChange={(e) =>
-                saveSettings({ ...settings, international_enabled: e.target.checked })
-              }
-            />
-            <span>International</span>
-          </label>
-          {settings.international_enabled && (
-            <div className="intl-bar-countries">
-              {EU_COUNTRIES.map((code) => {
-                const on = settings.check_countries.includes(code);
-                return (
-                  <button
-                    key={code}
-                    className={`intl-chip ${on ? "on" : ""}`}
-                    onClick={() => toggleCountry(code)}
-                  >
-                    {code}
-                  </button>
-                );
-              })}
-            </div>
-          )}
-        </div>
-        {settings.international_enabled && settings.check_countries.length > 4 && (
-          <div className="intl-warn">
-            {settings.check_countries.length} countries selected — each fetch makes ~
-            {settings.check_countries.length * 2 + 2} API calls. Fewer is faster.
-          </div>
-        )}
       </div>
 
       {statusMsg && <div className="status">{statusMsg}</div>}
@@ -1233,9 +1200,23 @@ export default function App() {
               </div>
             )}
 
-            {detailListing.variants.length > 0 && (
+            {detailListing.variants.length > 0 && (() => {
+              const inStock = detailListing.variants.filter((v) => v.in_stock !== false);
+              const hiddenCount = detailListing.variants.length - inStock.length;
+              const shown = showAllVariants ? detailListing.variants : inStock;
+              return (
               <div className="detail-variants">
-                <h3>Variants</h3>
+                <h3>
+                  Variants{" "}
+                  <span className="variant-count">
+                    ({inStock.length} available{hiddenCount > 0 ? ` · ${hiddenCount} out of stock hidden` : ""})
+                  </span>
+                  {hiddenCount > 0 && (
+                    <button className="mini-btn" onClick={() => setShowAllVariants((v) => !v)}>
+                      {showAllVariants ? "Hide unavailable" : "Show all"}
+                    </button>
+                  )}
+                </h3>
                 <table className="variant-table">
                   <thead>
                     <tr>
@@ -1245,7 +1226,7 @@ export default function App() {
                     </tr>
                   </thead>
                   <tbody>
-                    {detailListing.variants.map((v, i) => (
+                    {shown.map((v, i) => (
                       <tr key={i}>
                         <td>{v.label}</td>
                         <td>{v.price != null ? `$${v.price.toFixed(2)}` : "—"}</td>
@@ -1263,7 +1244,8 @@ export default function App() {
                   </tbody>
                 </table>
               </div>
-            )}
+              );
+            })()}
 
             {detailListing.debug_json && (
               <div className="detail-debug-line">
