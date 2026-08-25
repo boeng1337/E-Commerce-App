@@ -57,12 +57,14 @@ pub struct Listing {
     pub base_price_min: Option<f64>, // account-neutral base (calculation basis)
     #[serde(default)]
     pub base_price_max: Option<f64>,
+    #[serde(default)]
+    pub international: Vec<CountryResult>, // per-country price + deliverability, stored
 }
 
 /// Bump this whenever a fetch starts capturing new data. Listings stamped with
 /// a lower version (or none) are considered "outdated" and can be refetched to
 /// bring them up to the current shape.
-pub const CURRENT_DATA_VERSION: i64 = 5;
+pub const CURRENT_DATA_VERSION: i64 = 6;
 
 fn now_unix() -> i64 {
     std::time::SystemTime::now()
@@ -161,7 +163,7 @@ fn currency_for_country(country: &str, home_currency: &str) -> String {
 }
 
 /// Per-country result of an international availability/price check.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CountryResult {
     pub country: String,
     pub ships: bool,
@@ -349,6 +351,7 @@ fn add_manual_listing(state: State<AppState>, title: String, price: f64, stock: 
         primary_sku_id: None,
         base_price_min: None,
         base_price_max: None,
+        international: vec![],
     };
     state.listings.lock().unwrap().push(listing.clone());
     persist_listings(&state);
@@ -477,31 +480,47 @@ fn prices_from_json(json: &serde_json::Value) -> (Option<f64>, Option<f64>) {
 /// Fetches and builds a full Listing for the given country/currency. Does a
 /// DOUBLE fetch of the same product id (no sleep between — same id): the
 /// promotional price (default) becomes the listing's price_min/max, and a
-/// second base-price fetch (remove_personal_benefit) fills base_price_min/max,
-/// the account-neutral calculation basis. If a promotion is active the base is
-/// higher than the promo.
-async fn fetch_one_in(input: &str, country: &str, currency: &str) -> Result<Listing, String> {
+/// second base-price fetch (remove_personal_benefit) fills base_price_min/max.
+/// If `intl` is Some, also computes per-country international results inline and
+/// stores them on the listing (same product id — no sleep between any of it).
+async fn fetch_one_in(
+    input: &str,
+    country: &str,
+    currency: &str,
+    intl: Option<(&[String], &str)>, // (countries, home_currency)
+) -> Result<Listing, String> {
     // promotional fetch (the price shown / priority)
     let promo_json = fetch_raw(input, country, currency, false).await?;
     let mut listing = parse_product_json(&promo_json, input)?;
 
     // base fetch (calculation basis) — same id, no sleep between
-    match fetch_raw(input, country, currency, true).await {
-        Ok(base_json) => {
-            let (bmin, bmax) = prices_from_json(&base_json);
-            listing.base_price_min = bmin;
-            listing.base_price_max = bmax;
-        }
-        Err(_) => {
-            // base fetch failed — leave base prices None; promo still valid
+    if let Ok(base_json) = fetch_raw(input, country, currency, true).await {
+        let (bmin, bmax) = prices_from_json(&base_json);
+        listing.base_price_min = bmin;
+        listing.base_price_max = bmax;
+    }
+
+    // inline international — same product id, no sleep
+    if let Some((countries, home_currency)) = intl {
+        if !countries.is_empty() {
+            listing.international =
+                compute_international(input, listing.primary_sku_id.as_deref(), countries, home_currency)
+                    .await;
         }
     }
+
     Ok(listing)
 }
 
-/// Fetches a Listing using the app's configured home market (country/currency).
-async fn fetch_one(input: &str, home_country: &str, home_currency: &str) -> Result<Listing, String> {
-    fetch_one_in(input, home_country, home_currency).await
+/// Fetches a Listing using the app's configured home market, optionally with
+/// inline international results.
+async fn fetch_one(
+    input: &str,
+    home_country: &str,
+    home_currency: &str,
+    intl: Option<(&[String], &str)>,
+) -> Result<Listing, String> {
+    fetch_one_in(input, home_country, home_currency, intl).await
 }
 
 /// Extracts the numeric product id from a source URL or raw id string, mirroring
@@ -707,17 +726,28 @@ fn parse_product_json(json: &serde_json::Value, source_input: &str) -> Result<Li
         primary_sku_id,
         base_price_min: None,
         base_price_max: None,
+        international: vec![],
     })
 }
 
 /// Searches a single URL/product ID.
 #[tauri::command]
 async fn search_one(state: State<'_, AppState>, input: String) -> Result<Listing, String> {
-    let (hc, hcur) = {
+    let (hc, hcur, intl_countries) = {
         let s = state.settings.lock().unwrap();
-        (s.home_country.clone(), s.home_currency.clone())
+        let countries = if s.international_enabled {
+            s.check_countries.clone()
+        } else {
+            vec![]
+        };
+        (s.home_country.clone(), s.home_currency.clone(), countries)
     };
-    let listing = fetch_one(input.trim(), &hc, &hcur).await?;
+    let intl = if intl_countries.is_empty() {
+        None
+    } else {
+        Some((intl_countries.as_slice(), hcur.as_str()))
+    };
+    let listing = fetch_one(input.trim(), &hc, &hcur, intl).await?;
     state.listings.lock().unwrap().push(listing.clone());
     persist_listings(&state);
     Ok(listing)
@@ -734,7 +764,7 @@ async fn refetch_listing(
     id: String,
     release_override: Option<bool>,
 ) -> Result<Listing, String> {
-    let (source, prior_override) = {
+    let (source, prior_override, prior_intl) = {
         let listings = state.listings.lock().unwrap();
         let existing = listings
             .iter()
@@ -744,19 +774,21 @@ async fn refetch_listing(
             .source_url
             .clone()
             .ok_or_else(|| "this listing has no source URL to refetch".to_string())?;
-        (src, existing.price_override)
+        (src, existing.price_override, existing.international.clone())
     };
     let (hc, hcur) = {
         let s = state.settings.lock().unwrap();
         (s.home_country.clone(), s.home_currency.clone())
     };
 
-    let mut fresh = fetch_one(source.trim(), &hc, &hcur).await?;
+    let mut fresh = fetch_one(source.trim(), &hc, &hcur, None).await?;
     fresh.id = id.clone();
     // keep the manual price override unless the caller explicitly releases it
     if release_override != Some(true) {
         fresh.price_override = prior_override;
     }
+    // preserve stored international data (refetch doesn't redo the sweep)
+    fresh.international = prior_intl;
 
     {
         let mut listings = state.listings.lock().unwrap();
@@ -833,11 +865,11 @@ async fn refetch_many(
     let mut errors = Vec::new();
 
     for id in ids {
-        let (source, prior_override) = {
+        let (source, prior_override, prior_intl) = {
             let listings = state.listings.lock().unwrap();
             match listings.iter().find(|l| l.id == id) {
                 Some(l) => match l.source_url.clone() {
-                    Some(src) => (src, l.price_override),
+                    Some(src) => (src, l.price_override, l.international.clone()),
                     None => {
                         errors.push(format!("{id}: no source URL"));
                         continue;
@@ -850,12 +882,13 @@ async fn refetch_many(
             }
         };
 
-        match fetch_one(source.trim(), &hc, &hcur).await {
+        match fetch_one(source.trim(), &hc, &hcur, None).await {
             Ok(mut fresh) => {
                 fresh.id = id.clone();
                 if !release.contains(&id) {
                     fresh.price_override = prior_override;
                 }
+                fresh.international = prior_intl;
                 let mut listings = state.listings.lock().unwrap();
                 if let Some(slot) = listings.iter_mut().find(|l| l.id == id) {
                     *slot = fresh;
@@ -874,58 +907,25 @@ async fn refetch_many(
     })
 }
 
-/// Checks a product's price and REAL deliverability across the configured
-/// countries. Price comes from ds.product.get (which is accurate per country);
-/// deliverability comes from the AE-Freight endpoint (product.get's ships flag
-/// is unreliable — it reports the product available regardless of destination).
-/// Runs sequentially, respecting the sleep setting.
-#[tauri::command]
-async fn check_international(
-    state: State<'_, AppState>,
-    id: String,
-) -> Result<InternationalResult, String> {
-    let (source, sku_id) = {
-        let listings = state.listings.lock().unwrap();
-        let existing = listings
-            .iter()
-            .find(|l| l.id == id)
-            .ok_or_else(|| "listing not found".to_string())?;
-        let src = existing
-            .source_url
-            .clone()
-            .ok_or_else(|| "this listing has no source URL".to_string())?;
-        (src, existing.primary_sku_id.clone())
-    };
-    let (countries, home_currency) = {
-        let s = state.settings.lock().unwrap();
-        if !s.international_enabled {
-            return Err("international check is disabled in settings".to_string());
-        }
-        (s.check_countries.clone(), s.home_currency.clone())
-    };
-
-    // product id for freight = the numeric id from the source url / stored input
-    let product_id = extract_product_id(&source);
-
+/// Computes per-country price + real deliverability for a product. Shared by the
+/// inline fetch (when international is enabled) and the manual check command.
+/// No sleep between countries: it's all one product id.
+async fn compute_international(
+    source: &str,
+    sku_id: Option<&str>,
+    countries: &[String],
+    home_currency: &str,
+) -> Vec<CountryResult> {
+    let product_id = extract_product_id(source);
     let mut results = Vec::with_capacity(countries.len());
-    for country in countries {
-        let currency = currency_for_country(&country, &home_currency);
 
-        // 1) price + variants from product.get (accurate per country)
+    for country in countries {
+        let currency = currency_for_country(country, home_currency);
+
         let (price_min, price_max, variants, mut price_err) =
-            match fetch_raw(source.trim(), &country, &currency, false).await {
+            match fetch_raw(source.trim(), country, &currency, false).await {
                 Ok(json) => {
-                    let prices: Vec<f64> = json
-                        .get("prices")
-                        .and_then(|v| v.as_array())
-                        .map(|arr| arr.iter().filter_map(|v| v.as_f64()).collect())
-                        .unwrap_or_default();
-                    let pmin = prices.iter().cloned().fold(None, |acc: Option<f64>, p| {
-                        Some(acc.map_or(p, |a| a.min(p)))
-                    });
-                    let pmax = prices.iter().cloned().fold(None, |acc: Option<f64>, p| {
-                        Some(acc.map_or(p, |a| a.max(p)))
-                    });
+                    let (pmin, pmax) = prices_from_json(&json);
                     let vars: Vec<Variant> = json
                         .get("variant_prices")
                         .and_then(|v| v.as_array())
@@ -945,15 +945,14 @@ async fn check_international(
                 Err(e) => (None, None, vec![], Some(e)),
             };
 
-        // 2) REAL deliverability from freight
         let mut ships = false;
         let mut delivery_company = None;
         let mut delivery_days = None;
         let mut free_shipping = None;
         let mut freight_msg = None;
 
-        if let Some(sku) = sku_id.as_deref() {
-            match fetch_freight(&product_id, sku, &country, &currency).await {
+        if let Some(sku) = sku_id {
+            match fetch_freight(&product_id, sku, country, &currency).await {
                 Ok(fjson) => {
                     ships = fjson.get("ships").and_then(|v| v.as_bool()).unwrap_or(false);
                     freight_msg = fjson
@@ -966,8 +965,7 @@ async fn check_international(
                                 .get("company")
                                 .and_then(|v| v.as_str())
                                 .map(|s| s.to_string());
-                            free_shipping =
-                                first.get("free_shipping").and_then(|v| v.as_bool());
+                            free_shipping = first.get("free_shipping").and_then(|v| v.as_bool());
                             let min_d = first.get("min_days").and_then(|v| v.as_i64());
                             let max_d = first.get("max_days").and_then(|v| v.as_i64());
                             delivery_days = match (min_d, max_d) {
@@ -982,21 +980,17 @@ async fn check_international(
                     }
                 }
                 Err(e) => {
-                    // freight failed hard (not a "can't ship" answer, an actual error)
                     if price_err.is_none() {
                         price_err = Some(format!("freight: {e}"));
                     }
                 }
             }
         } else {
-            freight_msg = Some("no SKU id — refetch this listing to enable freight".to_string());
+            freight_msg = Some("no SKU id — refetch to enable freight".to_string());
         }
 
-        // No sleep here: the international sweep is all one product id, and the
-        // rule is sleep only between DIFFERENT product ids.
-
         results.push(CountryResult {
-            country,
+            country: country.clone(),
             ships,
             price_min,
             price_max,
@@ -1009,6 +1003,44 @@ async fn check_international(
             freight_msg,
         });
     }
+
+    results
+}
+
+/// Manual per-country check command (kept for refreshing a single listing).
+/// Stores the result on the listing so it persists.
+#[tauri::command]
+async fn check_international(
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<InternationalResult, String> {
+    let (source, sku_id) = {
+        let listings = state.listings.lock().unwrap();
+        let existing = listings
+            .iter()
+            .find(|l| l.id == id)
+            .ok_or_else(|| "listing not found".to_string())?;
+        let src = existing
+            .source_url
+            .clone()
+            .ok_or_else(|| "this listing has no source URL".to_string())?;
+        (src, existing.primary_sku_id.clone())
+    };
+    let (countries, home_currency) = {
+        let s = state.settings.lock().unwrap();
+        (s.check_countries.clone(), s.home_currency.clone())
+    };
+
+    let results = compute_international(&source, sku_id.as_deref(), &countries, &home_currency).await;
+
+    // persist onto the listing
+    {
+        let mut listings = state.listings.lock().unwrap();
+        if let Some(slot) = listings.iter_mut().find(|l| l.id == id) {
+            slot.international = results.clone();
+        }
+    }
+    persist_listings(&state);
 
     Ok(InternationalResult { id, countries: results })
 }
@@ -1039,15 +1071,26 @@ async fn search_bulk(
     let sleep_secs = settings.sleep_seconds;
     let hc = settings.home_country.clone();
     let hcur = settings.home_currency.clone();
+    let intl_countries: Vec<String> = if settings.international_enabled {
+        settings.check_countries.clone()
+    } else {
+        vec![]
+    };
 
     let mut handles = Vec::with_capacity(lines.len());
     for line in lines {
         let sem = semaphore.clone();
         let hc = hc.clone();
         let hcur = hcur.clone();
+        let countries = intl_countries.clone();
         handles.push(tokio::spawn(async move {
             let _permit = sem.acquire_owned().await.expect("semaphore closed");
-            let result = fetch_one(&line, &hc, &hcur).await;
+            let intl = if countries.is_empty() {
+                None
+            } else {
+                Some((countries.as_slice(), hcur.as_str()))
+            };
+            let result = fetch_one(&line, &hc, &hcur, intl).await;
             sleep(Duration::from_secs_f64(sleep_secs)).await;
             (line, result)
         }));

@@ -35,6 +35,7 @@ type Listing = {
   primary_sku_id: string | null;
   base_price_min: number | null;
   base_price_max: number | null;
+  international: CountryResult[];
 };
 
 type Settings = {
@@ -61,11 +62,6 @@ type CountryResult = {
   delivery_days: string | null;
   free_shipping: boolean | null;
   freight_msg: string | null;
-};
-
-type InternationalResult = {
-  id: string;
-  countries: CountryResult[];
 };
 
 // EU market countries (mirrors the Rust default). region grouping for the
@@ -104,7 +100,7 @@ type AuthStatus = {
 };
 
 // Must match CURRENT_DATA_VERSION in src-tauri/src/lib.rs
-const CURRENT_DATA_VERSION = 5;
+const CURRENT_DATA_VERSION = 6;
 
 function formatPrice(min: number | null, max: number | null): string {
   if (min == null && max == null) return "—";
@@ -142,6 +138,26 @@ function formatDate(unix: number | null): string {
   return d.toLocaleDateString() + " " + d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 }
 
+// Groups per-country results for the by-country dropdown:
+// available countries grouped by price (highest→lowest), same price merged with
+// commas; unavailable countries collected at the bottom.
+type PriceGroup = { price: number; currency: string; countries: string[] };
+function groupByPrice(intl: CountryResult[]): { groups: PriceGroup[]; unavailable: string[] } {
+  const available = intl.filter((c) => c.ships && c.price_min != null);
+  const unavailable = intl.filter((c) => !c.ships || c.price_min == null).map((c) => c.country);
+
+  const byPrice = new Map<string, PriceGroup>();
+  for (const c of available) {
+    const key = `${c.price_min!.toFixed(2)}_${c.currency}`;
+    if (!byPrice.has(key)) {
+      byPrice.set(key, { price: c.price_min!, currency: c.currency, countries: [] });
+    }
+    byPrice.get(key)!.countries.push(c.country);
+  }
+  const groups = Array.from(byPrice.values()).sort((a, b) => b.price - a.price);
+  return { groups, unavailable };
+}
+
 export default function App() {
   const [listings, setListings] = useState<Listing[]>([]);
   const [error, setError] = useState<string | null>(null);
@@ -165,6 +181,7 @@ export default function App() {
 
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [expandedId, setExpandedId] = useState<string | null>(null);
+  const [countryExpandedId, setCountryExpandedId] = useState<string | null>(null);
   const [detailId, setDetailId] = useState<string | null>(null);
   const [downloadingImages, setDownloadingImages] = useState(false);
   const [downloadMsg, setDownloadMsg] = useState<string | null>(null);
@@ -176,10 +193,6 @@ export default function App() {
 
   // image lightbox
   const [lightbox, setLightbox] = useState<{ images: string[]; index: number } | null>(null);
-
-  // international check
-  const [intl, setIntl] = useState<InternationalResult | null>(null);
-  const [intlBusy, setIntlBusy] = useState(false);
 
   // column show/hide menu
   const [columnsOpen, setColumnsOpen] = useState(false);
@@ -227,7 +240,6 @@ export default function App() {
     setDownloadMsg(null);
     setCopiedDebug(false);
     setEditingPrice(false);
-    setIntl(null);
   }
 
   // Escape closes the detail drawer
@@ -238,11 +250,6 @@ export default function App() {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [detailId]);
-
-  // Reset international results when switching to a different listing
-  useEffect(() => {
-    setIntl(null);
   }, [detailId]);
 
   async function saveSettings(next: Settings) {
@@ -581,27 +588,6 @@ export default function App() {
     return settings.sort_dir === "desc" ? " ▼" : " ▲";
   }
 
-  // --- International check ---
-  async function runInternational() {
-    if (!detailListing) return;
-    if (!settings.international_enabled) {
-      setError("Enable the international check in Settings first.");
-      return;
-    }
-    setIntlBusy(true);
-    setIntl(null);
-    try {
-      const result = await invoke<InternationalResult>("check_international", {
-        id: detailListing.id,
-      });
-      setIntl(result);
-    } catch (e) {
-      setError(String(e));
-    } finally {
-      setIntlBusy(false);
-    }
-  }
-
   // region toggle in settings
   async function toggleAllEU(on: boolean) {
     await saveSettings({ ...settings, check_countries: on ? EU_COUNTRIES : [] });
@@ -648,6 +634,40 @@ export default function App() {
           />
           {busy && <span className="search-spinner">Working…</span>}
         </div>
+        <div className="intl-bar">
+          <label className="intl-toggle">
+            <input
+              type="checkbox"
+              checked={settings.international_enabled}
+              onChange={(e) =>
+                saveSettings({ ...settings, international_enabled: e.target.checked })
+              }
+            />
+            <span>International</span>
+          </label>
+          {settings.international_enabled && (
+            <div className="intl-bar-countries">
+              {EU_COUNTRIES.map((code) => {
+                const on = settings.check_countries.includes(code);
+                return (
+                  <button
+                    key={code}
+                    className={`intl-chip ${on ? "on" : ""}`}
+                    onClick={() => toggleCountry(code)}
+                  >
+                    {code}
+                  </button>
+                );
+              })}
+            </div>
+          )}
+        </div>
+        {settings.international_enabled && settings.check_countries.length > 4 && (
+          <div className="intl-warn">
+            {settings.check_countries.length} countries selected — each fetch makes ~
+            {settings.check_countries.length * 2 + 2} API calls. Fewer is faster.
+          </div>
+        )}
       </div>
 
       {statusMsg && <div className="status">{statusMsg}</div>}
@@ -751,6 +771,16 @@ export default function App() {
                       {expandedId === l.id ? "▲" : "▼"} {l.variants.length} variants
                     </button>
                   )}
+                  {l.international.length > 0 && (
+                    <button
+                      className="variant-toggle"
+                      onClick={() =>
+                        setCountryExpandedId((prev) => (prev === l.id ? null : l.id))
+                      }
+                    >
+                      {countryExpandedId === l.id ? "▲" : "▼"} by country
+                    </button>
+                  )}
                 </td>
                 {isColVisible("category") && <td>{l.category ?? "—"}</td>}
                 {isColVisible("warehouse") && <td>{l.warehouse ?? "—"}</td>}
@@ -789,6 +819,39 @@ export default function App() {
                     <td></td>
                   </tr>
                 ))}
+              {countryExpandedId === l.id && (() => {
+                const { groups, unavailable } = groupByPrice(l.international);
+                return (
+                  <>
+                    {groups.map((g, i) => (
+                      <tr key={`${l.id}-cg-${i}`} className="variant-row">
+                        <td className="col-check"></td>
+                        <td className="col-img"></td>
+                        <td className="variant-label" colSpan={12}>
+                          <span className="country-list">{g.countries.join(", ")}</span>
+                          {" — "}
+                          <span className="country-price">
+                            {g.price.toFixed(2)} {g.currency}
+                          </span>
+                        </td>
+                        <td></td>
+                      </tr>
+                    ))}
+                    {unavailable.length > 0 && (
+                      <tr key={`${l.id}-cg-unavail`} className="variant-row">
+                        <td className="col-check"></td>
+                        <td className="col-img"></td>
+                        <td className="variant-label country-unavail" colSpan={12}>
+                          <span className="country-list">{unavailable.join(", ")}</span>
+                          {" — "}
+                          <span className="badge out-of-stock">no</span>
+                        </td>
+                        <td></td>
+                      </tr>
+                    )}
+                  </>
+                );
+              })()}
             </Fragment>
           ))}
           {listings.length === 0 && (
@@ -1048,15 +1111,6 @@ export default function App() {
                   {downloadingImages ? "Downloading…" : "Download images"}
                 </button>
               )}
-              {detailListing.source_url && settings.international_enabled && (
-                <button
-                  className="secondary-btn download-btn"
-                  onClick={runInternational}
-                  disabled={intlBusy}
-                >
-                  {intlBusy ? "Checking…" : "View international prices"}
-                </button>
-              )}
             </div>
             {downloadMsg && <div className="download-msg">{downloadMsg}</div>}
 
@@ -1124,7 +1178,7 @@ export default function App() {
               <div>Last fetched: {formatDate(detailListing.last_fetched)}</div>
             </div>
 
-            {intl && (
+            {detailListing.international.length > 0 && (
               <div className="detail-intl">
                 <h3>International prices & shipping</h3>
                 <table className="variant-table">
@@ -1137,7 +1191,9 @@ export default function App() {
                     </tr>
                   </thead>
                   <tbody>
-                    {intl.countries.map((c) => (
+                    {[...detailListing.international]
+                      .sort((a, b) => (b.price_min ?? -1) - (a.price_min ?? -1))
+                      .map((c) => (
                       <tr key={c.country} className={c.ships ? "" : "intl-noship"}>
                         <td>{c.country}</td>
                         <td>
@@ -1171,8 +1227,8 @@ export default function App() {
                   </tbody>
                 </table>
                 <p className="intl-note">
-                  Availability comes from the freight endpoint (real per-country
-                  deliverability). Price comes from the product API.
+                  Availability from the freight endpoint (real per-country
+                  deliverability); price from the product API. Fetched with the listing.
                 </p>
               </div>
             )}
