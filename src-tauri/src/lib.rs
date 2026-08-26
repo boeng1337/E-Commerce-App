@@ -59,12 +59,14 @@ pub struct Listing {
     pub base_price_max: Option<f64>,
     #[serde(default)]
     pub international: Vec<CountryResult>, // per-country price + deliverability, stored
+    #[serde(default)]
+    pub skus: Vec<SkuDetail>, // full SKU list for continent-aware freight selection
 }
 
 /// Bump this whenever a fetch starts capturing new data. Listings stamped with
 /// a lower version (or none) are considered "outdated" and can be refetched to
 /// bring them up to the current shape.
-pub const CURRENT_DATA_VERSION: i64 = 6;
+pub const CURRENT_DATA_VERSION: i64 = 7;
 
 fn now_unix() -> i64 {
     std::time::SystemTime::now()
@@ -162,6 +164,64 @@ fn currency_for_country(country: &str, home_currency: &str) -> String {
     .to_string()
 }
 
+/// Per-SKU detail parsed from the product, used for continent-aware freight
+/// selection (which warehouse can serve which destination).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SkuDetail {
+    pub sku_id: Option<String>,
+    pub label: Option<String>,
+    pub ship_from: Option<String>, // warehouse origin, e.g. "China Mainland", "Allemagne"
+    pub stock: Option<i64>,
+    pub price: Option<f64>,
+}
+
+/// Maps a country (ISO-2 or a ship-from label) to a coarse continent bucket.
+/// Groups: Europe, Russia (alone), Americas (N+S merged), Oceania, Asia, China.
+/// China is special — it ships worldwide, so it's always a candidate.
+fn continent_of(name: &str) -> &'static str {
+    let n = name.to_lowercase();
+    // China detection (label or code) — its own bucket, always checked.
+    if n.contains("china") || n.contains("chine") || n == "cn" {
+        return "China";
+    }
+    if n.contains("russia") || n.contains("russie") || n == "ru" {
+        return "Russia";
+    }
+    // Ship-from labels are country names (often French from the API); ISO codes
+    // are destinations. Cover both.
+    const EUROPE: &[&str] = &[
+        "de","fr","es","it","pl","nl","be","se","at","dk","fi","gr","cz","ro","hu",
+        "sk","bg","hr","lt","lv","ee","si","lu","pt","ie","uk","gb",
+        "allemagne","france","espagne","italie","pologne","pays-bas","belgique",
+        "suède","autriche","danemark","finlande","grèce","royaume-uni","portugal",
+        "irlande","tchèque","république tchèque","roumanie","hongrie",
+        "émirats arabes unis","uae", // gulf warehouses tend to serve EU routes; keep with EU cluster
+    ];
+    const AMERICAS: &[&str] = &[
+        "us","usa","ca","mx","br","ar","cl","co","pe","uy","bo","py","ec","ve",
+        "états-unis","etats-unis","canada","mexique","brésil","bresil","argentine",
+        "chili","colombie","pérou","perou",
+    ];
+    const OCEANIA: &[&str] = &["au","nz","australie","nouvelle-zélande","new zealand"];
+    const ASIA: &[&str] = &[
+        "jp","kr","sg","my","th","vn","id","ph","in","hk","tw",
+        "japon","corée","corée du sud","singapour","malaisie","thaïlande",
+        "vietnam","indonésie","philippines","inde","hong kong","taïwan",
+    ];
+
+    if EUROPE.iter().any(|c| n == *c) {
+        "Europe"
+    } else if AMERICAS.iter().any(|c| n == *c) {
+        "Americas"
+    } else if OCEANIA.iter().any(|c| n == *c) {
+        "Oceania"
+    } else if ASIA.iter().any(|c| n == *c) {
+        "Asia"
+    } else {
+        "Other"
+    }
+}
+
 /// Per-country result of an international availability/price check.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CountryResult {
@@ -177,6 +237,10 @@ pub struct CountryResult {
     pub delivery_days: Option<String>,
     pub free_shipping: Option<bool>,
     pub freight_msg: Option<String>,
+    // which warehouse actually served this country, and the matched SKU's price
+    pub ship_from: Option<String>,
+    pub matched_price: Option<f64>,
+    pub matched_variant: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -352,6 +416,7 @@ fn add_manual_listing(state: State<AppState>, title: String, price: f64, stock: 
         base_price_min: None,
         base_price_max: None,
         international: vec![],
+        skus: vec![],
     };
     state.listings.lock().unwrap().push(listing.clone());
     persist_listings(&state);
@@ -503,9 +568,9 @@ async fn fetch_one_in(
     // inline international — same product id, no sleep
     if let Some((countries, home_currency)) = intl {
         if !countries.is_empty() {
+            let skus = listing.skus.clone();
             listing.international =
-                compute_international(input, listing.primary_sku_id.as_deref(), countries, home_currency)
-                    .await;
+                compute_international(input, &skus, countries, home_currency).await;
         }
     }
 
@@ -698,6 +763,22 @@ fn parse_product_json(json: &serde_json::Value, source_input: &str) -> Result<Li
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
+    let skus: Vec<SkuDetail> = json
+        .get("skus")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .map(|s| SkuDetail {
+                    sku_id: s.get("sku_id").and_then(|v| v.as_str()).map(|x| x.to_string()),
+                    label: s.get("label").and_then(|v| v.as_str()).map(|x| x.to_string()),
+                    ship_from: s.get("ship_from").and_then(|v| v.as_str()).map(|x| x.to_string()),
+                    stock: s.get("stock").and_then(|v| v.as_i64()),
+                    price: s.get("price").and_then(|v| v.as_f64()),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
     Ok(Listing {
         id: Uuid::new_v4().to_string(),
         title: name,
@@ -727,6 +808,7 @@ fn parse_product_json(json: &serde_json::Value, source_input: &str) -> Result<Li
         base_price_min: None,
         base_price_max: None,
         international: vec![],
+        skus,
     })
 }
 
@@ -912,16 +994,24 @@ async fn refetch_many(
 /// No sleep between countries: it's all one product id.
 async fn compute_international(
     source: &str,
-    sku_id: Option<&str>,
+    skus: &[SkuDetail],
     countries: &[String],
     home_currency: &str,
 ) -> Vec<CountryResult> {
     let product_id = extract_product_id(source);
     let mut results = Vec::with_capacity(countries.len());
 
+    // In-stock SKUs only (out-of-stock can never ship — never freight-check them).
+    let in_stock: Vec<&SkuDetail> = skus
+        .iter()
+        .filter(|s| s.sku_id.is_some() && s.stock.map(|n| n > 0).unwrap_or(false))
+        .collect();
+
     for country in countries {
         let currency = currency_for_country(country, home_currency);
+        let dest_continent = continent_of(country);
 
+        // price + variants (per-country) from product.get
         let (price_min, price_max, variants, mut price_err) =
             match fetch_raw(source.trim(), country, &currency, false).await {
                 Ok(json) => {
@@ -945,38 +1035,70 @@ async fn compute_international(
                 Err(e) => (None, None, vec![], Some(e)),
             };
 
+        // Candidate SKUs for this destination: in-stock warehouses on the SAME
+        // continent as the destination, PLUS China (ships worldwide). Skip
+        // other continents entirely — cross-continental almost never ships and
+        // we don't want to waste freight calls proving it.
+        let mut candidates: Vec<&SkuDetail> = in_stock
+            .iter()
+            .filter(|s| {
+                let origin = s.ship_from.as_deref().unwrap_or("");
+                let oc = continent_of(origin);
+                oc == "China" || oc == dest_continent
+            })
+            .map(|s| *s)
+            .collect();
+        // Check cheaper warehouses first so the first that ships is the cheapest.
+        candidates.sort_by(|a, b| {
+            a.price
+                .unwrap_or(f64::INFINITY)
+                .partial_cmp(&b.price.unwrap_or(f64::INFINITY))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
         let mut ships = false;
         let mut delivery_company = None;
         let mut delivery_days = None;
         let mut free_shipping = None;
         let mut freight_msg = None;
+        let mut ship_from = None;
+        let mut matched_price = None;
+        let mut matched_variant = None;
 
-        if let Some(sku) = sku_id {
+        if candidates.is_empty() {
+            freight_msg = Some("no in-stock warehouse on this continent or China".to_string());
+        }
+
+        for cand in &candidates {
+            let sku = match cand.sku_id.as_deref() {
+                Some(s) => s,
+                None => continue,
+            };
             match fetch_freight(&product_id, sku, country, &currency).await {
                 Ok(fjson) => {
-                    ships = fjson.get("ships").and_then(|v| v.as_bool()).unwrap_or(false);
-                    freight_msg = fjson
-                        .get("msg")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string());
-                    if let Some(opts) = fjson.get("options").and_then(|v| v.as_array()) {
-                        if let Some(first) = opts.first() {
-                            delivery_company = first
-                                .get("company")
-                                .and_then(|v| v.as_str())
-                                .map(|s| s.to_string());
-                            free_shipping = first.get("free_shipping").and_then(|v| v.as_bool());
-                            let min_d = first.get("min_days").and_then(|v| v.as_i64());
-                            let max_d = first.get("max_days").and_then(|v| v.as_i64());
-                            delivery_days = match (min_d, max_d) {
-                                (Some(a), Some(b)) => Some(format!("{a}–{b} days")),
-                                (Some(a), None) => Some(format!("{a}+ days")),
-                                _ => first
-                                    .get("delivery_date_desc")
-                                    .and_then(|v| v.as_str())
-                                    .map(|s| s.to_string()),
-                            };
+                    let this_ships = fjson.get("ships").and_then(|v| v.as_bool()).unwrap_or(false);
+                    if this_ships {
+                        ships = true;
+                        ship_from = cand.ship_from.clone();
+                        matched_price = cand.price;
+                        matched_variant = cand.label.clone();
+                        freight_msg = fjson.get("msg").and_then(|v| v.as_str()).map(|s| s.to_string());
+                        if let Some(opts) = fjson.get("options").and_then(|v| v.as_array()) {
+                            if let Some(first) = opts.first() {
+                                delivery_company = first.get("company").and_then(|v| v.as_str()).map(|s| s.to_string());
+                                free_shipping = first.get("free_shipping").and_then(|v| v.as_bool());
+                                let min_d = first.get("min_days").and_then(|v| v.as_i64());
+                                let max_d = first.get("max_days").and_then(|v| v.as_i64());
+                                delivery_days = match (min_d, max_d) {
+                                    (Some(a), Some(b)) => Some(format!("{a}–{b} days")),
+                                    (Some(a), None) => Some(format!("{a}+ days")),
+                                    _ => first.get("delivery_date_desc").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                                };
+                            }
                         }
+                        break; // cheapest shipping candidate found — stop
+                    } else if freight_msg.is_none() {
+                        freight_msg = fjson.get("msg").and_then(|v| v.as_str()).map(|s| s.to_string());
                     }
                 }
                 Err(e) => {
@@ -985,8 +1107,6 @@ async fn compute_international(
                     }
                 }
             }
-        } else {
-            freight_msg = Some("no SKU id — refetch to enable freight".to_string());
         }
 
         results.push(CountryResult {
@@ -1001,6 +1121,9 @@ async fn compute_international(
             delivery_days,
             free_shipping,
             freight_msg,
+            ship_from,
+            matched_price,
+            matched_variant,
         });
     }
 
@@ -1014,7 +1137,7 @@ async fn check_international(
     state: State<'_, AppState>,
     id: String,
 ) -> Result<InternationalResult, String> {
-    let (source, sku_id) = {
+    let (source, skus) = {
         let listings = state.listings.lock().unwrap();
         let existing = listings
             .iter()
@@ -1024,14 +1147,14 @@ async fn check_international(
             .source_url
             .clone()
             .ok_or_else(|| "this listing has no source URL".to_string())?;
-        (src, existing.primary_sku_id.clone())
+        (src, existing.skus.clone())
     };
     let (countries, home_currency) = {
         let s = state.settings.lock().unwrap();
         (s.check_countries.clone(), s.home_currency.clone())
     };
 
-    let results = compute_international(&source, sku_id.as_deref(), &countries, &home_currency).await;
+    let results = compute_international(&source, &skus, &countries, &home_currency).await;
 
     // persist onto the listing
     {

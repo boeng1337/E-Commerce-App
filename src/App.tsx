@@ -36,6 +36,15 @@ type Listing = {
   base_price_min: number | null;
   base_price_max: number | null;
   international: CountryResult[];
+  skus: SkuDetail[];
+};
+
+type SkuDetail = {
+  sku_id: string | null;
+  label: string | null;
+  ship_from: string | null;
+  stock: number | null;
+  price: number | null;
 };
 
 type Settings = {
@@ -62,6 +71,9 @@ type CountryResult = {
   delivery_days: string | null;
   free_shipping: boolean | null;
   freight_msg: string | null;
+  ship_from: string | null;
+  matched_price: number | null;
+  matched_variant: string | null;
 };
 
 // EU market countries (mirrors the Rust default). region grouping for the
@@ -100,7 +112,7 @@ type AuthStatus = {
 };
 
 // Must match CURRENT_DATA_VERSION in src-tauri/src/lib.rs
-const CURRENT_DATA_VERSION = 6;
+const CURRENT_DATA_VERSION = 7;
 
 function formatPrice(min: number | null, max: number | null): string {
   if (min == null && max == null) return "—";
@@ -1147,55 +1159,66 @@ export default function App() {
 
             {detailListing.international.length > 0 && (
               <div className="detail-intl">
-                <h3>International prices & shipping</h3>
+                <h3>International — price & shipping by country</h3>
                 <table className="variant-table">
                   <thead>
                     <tr>
                       <th>Country</th>
                       <th>Ships</th>
                       <th>Price</th>
+                      <th>Warehouse</th>
                       <th>Delivery</th>
                     </tr>
                   </thead>
                   <tbody>
                     {[...detailListing.international]
-                      .sort((a, b) => (b.price_min ?? -1) - (a.price_min ?? -1))
-                      .map((c) => (
-                      <tr key={c.country} className={c.ships ? "" : "intl-noship"}>
-                        <td>{c.country}</td>
-                        <td>
-                          {c.error ? (
-                            <span className="badge out-of-stock" title={c.error}>error</span>
-                          ) : c.ships ? (
-                            <span className="badge in-stock">yes</span>
-                          ) : (
-                            <span className="badge out-of-stock" title={c.freight_msg ?? ""}>no</span>
-                          )}
-                        </td>
-                        <td>
-                          {c.price_min != null
-                            ? `${c.price_min.toFixed(2)}${c.price_max != null && c.price_max !== c.price_min ? `–${c.price_max.toFixed(2)}` : ""} ${c.currency}`
-                            : "—"}
-                        </td>
-                        <td className="intl-delivery">
-                          {c.ships ? (
-                            <>
-                              {c.free_shipping ? "Free" : ""}
-                              {c.delivery_company ? ` ${c.delivery_company}` : ""}
-                              {c.delivery_days ? ` · ${c.delivery_days}` : ""}
-                              {!c.delivery_company && !c.delivery_days ? "—" : ""}
-                            </>
-                          ) : (
-                            "—"
-                          )}
-                        </td>
-                      </tr>
-                    ))}
+                      .sort((a, b) => {
+                        // ships-first, then cheapest → most expensive (small to big)
+                        if (a.ships !== b.ships) return a.ships ? -1 : 1;
+                        const pa = a.matched_price ?? a.price_min ?? Infinity;
+                        const pb = b.matched_price ?? b.price_min ?? Infinity;
+                        return pa - pb;
+                      })
+                      .map((c) => {
+                        const price = c.matched_price ?? c.price_min;
+                        // warehouse label: "local" if it ships from within the
+                        // destination country, else the origin name.
+                        const wh = c.ship_from
+                          ? (c.ship_from.toLowerCase().includes(c.country.toLowerCase()) ? "local" : c.ship_from)
+                          : "—";
+                        return (
+                          <tr key={c.country} className={c.ships ? "" : "intl-noship"}>
+                            <td>{c.country}</td>
+                            <td>
+                              {c.error ? (
+                                <span className="badge out-of-stock" title={c.error}>error</span>
+                              ) : c.ships ? (
+                                <span className="badge in-stock">yes</span>
+                              ) : (
+                                <span className="badge out-of-stock" title={c.freight_msg ?? ""}>no</span>
+                              )}
+                            </td>
+                            <td>{price != null ? `${price.toFixed(2)} ${c.currency}` : "—"}</td>
+                            <td>{c.ships ? wh : "—"}</td>
+                            <td className="intl-delivery">
+                              {c.ships ? (
+                                <>
+                                  {c.free_shipping ? "Free" : ""}
+                                  {c.delivery_days ? ` ${c.delivery_days}` : ""}
+                                  {!c.free_shipping && !c.delivery_days ? (c.delivery_company ?? "—") : ""}
+                                </>
+                              ) : (
+                                "—"
+                              )}
+                            </td>
+                          </tr>
+                        );
+                      })}
                   </tbody>
                 </table>
                 <p className="intl-note">
-                  Availability from the freight endpoint (real per-country
-                  deliverability); price from the product API. Fetched with the listing.
+                  Warehouse chosen automatically: in-stock same-continent origin or
+                  China, cheapest that ships. "local" = ships from within that country.
                 </p>
               </div>
             )}

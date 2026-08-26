@@ -260,8 +260,9 @@ def fetch_product(url_or_id, ship_to_country="FR", target_currency="EUR",
     if isinstance(sku_list, dict):
         sku_list = [sku_list]
 
-    warehouse = None  # ship-from location, extracted from SKU properties
+    warehouse = None  # ship-from location (first seen), for the headline
     primary_sku_id = None  # first SKU id, used for freight/deliverability queries
+    skus_detail = []  # full per-SKU data for continent-aware freight selection
 
     for sku in sku_list:
         if primary_sku_id is None and sku.get("sku_id"):
@@ -274,7 +275,9 @@ def fetch_product(url_or_id, ship_to_country="FR", target_currency="EUR",
 
         # build a readable label. Prefer property_value_definition_name (the
         # MEANINGFUL value, e.g. "500GB") over sku_property_value (a code).
+        # Also capture THIS sku's ship-from origin (not just the first).
         label_parts = []
+        sku_ship_from = None
         props = (sku.get("ae_sku_property_dtos", {}) or {}).get("ae_sku_property_d_t_o", []) or []
         if isinstance(props, dict):
             props = [props]
@@ -287,6 +290,7 @@ def fetch_product(url_or_id, ship_to_country="FR", target_currency="EUR",
             if any(h in pname for h in _SHIP_PROPERTY_HINTS):
                 if warehouse is None:
                     warehouse = str(val)
+                sku_ship_from = str(val)
                 continue
             label_parts.append(str(val))
         label = " / ".join(label_parts) if label_parts else (sku.get("sku_id") or "variant")
@@ -307,6 +311,13 @@ def fetch_product(url_or_id, ship_to_country="FR", target_currency="EUR",
 
         variants.append(label)
         variant_prices.append({"variant": label, "price": price, "in_stock": in_stock})
+        skus_detail.append({
+            "sku_id": str(sku.get("sku_id")) if sku.get("sku_id") else None,
+            "label": label,
+            "ship_from": sku_ship_from,
+            "stock": stock_n,
+            "price": price,
+        })
         # only in-stock prices count toward the product's headline price range,
         # so an out-of-stock decoy price doesn't drag the range down
         if price is not None and in_stock:
@@ -372,6 +383,7 @@ def fetch_product(url_or_id, ship_to_country="FR", target_currency="EUR",
         "product_status": product_status,
         "ships": ships,
         "primary_sku_id": primary_sku_id,
+        "skus": skus_detail,
         "api_category_id": category_name or category_id_api,
         "brand": brand,
         "_raw": resp,
