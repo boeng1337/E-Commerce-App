@@ -1,14 +1,11 @@
 name: Release
-
 on:
   push:
     tags:
       - "v*"
   workflow_dispatch: {}
-
 permissions:
   contents: write
-
 jobs:
   build-arch:
     runs-on: ubuntu-22.04
@@ -21,46 +18,39 @@ jobs:
           pacman -S --noconfirm --needed git base-devel curl wget file openssl \
             webkit2gtk-4.1 librsvg libappindicator-gtk3 nodejs npm rustup fuse2 \
             desktop-file-utils mesa zsync gtk3
-
       - name: Trust the workspace directory
         run: git config --global --add safe.directory '*'
-
       - uses: actions/checkout@v4
-
       - name: Set up Rust
         run: |
           rustup default stable
-
       - name: Install frontend deps
         run: npm ci
-
       - name: Build frontend
         run: npm run build
-
       - name: Build Tauri app (Arch, binary only)
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         working-directory: src-tauri
         run: |
           cargo build --release --features custom-protocol
-
       - name: Package as self-extracting single file
         run: |
           mkdir -p dist-arch
           cp src-tauri/target/release/aliexpress-manager dist-arch/
           cp -r src-tauri/icons dist-arch/ || true
-
           mkdir -p dist-arch/python
+          # Copy ALL runtime python scripts. Missing one here means the packaged
+          # app can't find it at runtime even though it's in the repo -- this is
+          # why international shipping (ae_freight_cli.py) failed before.
           cp python/ae_client.py python/ae_cli.py python/ae_auth_cli.py \
-             python/config.py python/requirements.txt dist-arch/python/
+             python/ae_freight_cli.py python/config.py python/requirements.txt \
+             dist-arch/python/
           # api_keys.env is intentionally NOT bundled -- it's gitignored and
-          # holds real secrets. The persistent extract dir preserves it
-          # across re-extractions (tar never deletes files absent from the
-          # archive), so once you save credentials in-app they survive
-          # every future run/update of this package.
-
+          # holds real secrets. The persistent extract dir preserves it across
+          # re-extractions (tar never deletes files absent from the archive),
+          # so once you save credentials in-app they survive every future run.
           tar -czf payload.tar.gz -C dist-arch .
-
           printf '%s\n' \
             '#!/usr/bin/env bash' \
             'set -e' \
@@ -79,10 +69,8 @@ jobs:
             'export WEBKIT_DISABLE_DMABUF_RENDERER=1' \
             'exec "$PERSIST_DIR/aliexpress-manager" "$@"' \
             '__PAYLOAD_BELOW__' > aliexpress-manager-arch.run
-
           cat payload.tar.gz >> aliexpress-manager-arch.run
           chmod +x aliexpress-manager-arch.run
-
       - name: Create/update release
         uses: softprops/action-gh-release@v2
         with:
