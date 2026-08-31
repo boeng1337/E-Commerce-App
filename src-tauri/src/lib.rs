@@ -93,6 +93,8 @@ pub struct Settings {
     pub sort_key: Option<String>,
     #[serde(default)]
     pub sort_dir: Option<String>, // "asc" | "desc"
+    #[serde(default)]
+    pub debug_mode: bool, // when on, the detail view can load raw debug JSON
 }
 
 fn default_home_country() -> String {
@@ -126,6 +128,7 @@ impl Default for Settings {
             hidden_columns: vec![],
             sort_key: None,
             sort_dir: None,
+            debug_mode: false,
         }
     }
 }
@@ -382,7 +385,34 @@ fn set_settings(state: State<AppState>, settings: Settings) -> Settings {
 
 #[tauri::command]
 fn get_listings(state: State<AppState>) -> Vec<Listing> {
-    state.listings.lock().unwrap().clone()
+    // Strip debug_json from the bulk payload: it's the full raw API response
+    // (can be ~100KB+ per listing) and is only needed on demand in the detail
+    // view. Shipping it for every listing bloats memory and slows the table.
+    // It's still persisted to disk and fetchable via get_debug_json(id).
+    state
+        .listings
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|l| {
+            let mut c = l.clone();
+            c.debug_json = None;
+            c
+        })
+        .collect()
+}
+
+/// Returns just one listing's raw debug JSON, loaded on demand (kept out of the
+/// bulk get_listings payload for performance).
+#[tauri::command]
+fn get_debug_json(state: State<AppState>, id: String) -> Option<String> {
+    state
+        .listings
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|l| l.id == id)
+        .and_then(|l| l.debug_json.clone())
 }
 
 #[tauri::command]
@@ -1468,6 +1498,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             get_listings,
+            get_debug_json,
             add_manual_listing,
             delete_listing,
             search_one,
