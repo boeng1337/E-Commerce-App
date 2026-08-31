@@ -57,6 +57,7 @@ type Settings = {
   hidden_columns: string[];
   sort_key: string | null;
   sort_dir: string | null;
+  debug_mode: boolean;
 };
 
 type CountryResult = {
@@ -189,6 +190,7 @@ export default function App() {
     hidden_columns: [],
     sort_key: null,
     sort_dir: null,
+    debug_mode: false,
   });
 
   const [selected, setSelected] = useState<Set<string>>(new Set());
@@ -356,9 +358,16 @@ export default function App() {
   }
 
   async function copyDebugJson() {
-    if (!detailListing?.debug_json) return;
+    if (!detailListing) return;
     try {
-      await navigator.clipboard.writeText(detailListing.debug_json);
+      // debug_json is no longer carried on the listing (kept out of the bulk
+      // payload for performance); fetch it on demand.
+      const raw = await invoke<string | null>("get_debug_json", { id: detailListing.id });
+      if (!raw) {
+        setDownloadMsg("No debug JSON stored for this listing.");
+        return;
+      }
+      await navigator.clipboard.writeText(raw);
       setCopiedDebug(true);
       setTimeout(() => setCopiedDebug(false), 1500);
     } catch (e) {
@@ -944,6 +953,24 @@ export default function App() {
               )}
             </div>
 
+            <div className="intl-section">
+              <h3>Advanced</h3>
+              <label className="field-check">
+                <input
+                  type="checkbox"
+                  checked={settings.debug_mode}
+                  onChange={(e) =>
+                    saveSettings({ ...settings, debug_mode: e.target.checked })
+                  }
+                />
+                <span>Debug mode (show raw JSON copy in detail view)</span>
+              </label>
+              <p className="intl-note">
+                Off by default. The raw API response is kept out of the listing table
+                for speed and only loaded on demand when this is on.
+              </p>
+            </div>
+
             <div className="auth-section">
               <h3>AliExpress Connection</h3>
 
@@ -1270,7 +1297,7 @@ export default function App() {
               );
             })()}
 
-            {detailListing.debug_json && (
+            {settings.debug_mode && (
               <div className="detail-debug-line">
                 <span>Debug JSON</span>
                 <button className="mini-btn" onClick={copyDebugJson}>
